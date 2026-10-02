@@ -37,7 +37,7 @@ rem All of it in one block: cmd reads a .bat file while it runs it, and the merg
   echo  Saving our updated version to github.com/Mirtraxxx/Strata ...
   git push fork mine || echo  ^(could not upload it; the update itself is fine - Claude can push it later^)
   echo  Compiling the engine ^(a few minutes when it changed, seconds when not^) ...
-  call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul
+  call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul 2>nul
   "%~dp0.venv\Scripts\cmake.exe" --build build-release --target strata -j 8 || (
     echo.
     echo  The engine did not compile ^(the reason is above^). The code is updated, the installed engine is unchanged.
