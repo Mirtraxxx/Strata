@@ -3,7 +3,7 @@ rem Updates this Strata folder from the official project (Niko1221/Strata) while
 rem "mine", also on github.com/Mirtraxxx/Strata). Use this instead of UPDATE.bat: UPDATE.bat only does a plain
 rem fast-forward pull, which stops as soon as the folder has changes of its own.
 rem Steps: get the official code, merge it into ours, compile the engine, install it (Strata must be closed for
-rem that), then Strata's own package/settings update without touching the engine. If the official update clashes
+rem that), then the Python packages from requirements.txt. If the official update clashes
 rem with our changes, nothing is changed and Claude does the merge by hand.
 setlocal
 title Strata - update (keeping our changes)
@@ -59,8 +59,10 @@ rem All of it in one block: cmd reads a .bat file while it runs it, and the merg
       exit /b 1
     )
   )
-  echo  Updating Strata's Python packages and model settings ...
-  "%~dp0.venv\Scripts\python.exe" setup.py --update --build
+  echo  Updating Strata's Python packages ...
+  rem not setup.py: it would rebuild the engine over ours (our BUILD.json has no source fingerprint) and redo
+  rem the hand-tuned model configs
+  "%~dp0.venv\Scripts\python.exe" -m pip install -q -r requirements.txt
   echo.
   echo  Done. Start Strata the usual way.
   pause
