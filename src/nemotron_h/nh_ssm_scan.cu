@@ -11,9 +11,13 @@
 
 namespace nh {
 
-// Defined in nh_kernels.cuh (one TU per binary: nh_engine.cu, or nh_ssm_scan_test.cu).
+// Defined in nh_kernels.cuh (one TU per binary: nh_engine.cu, or nh_ssm_scan_test.cu).  Do not include that header
+// here: nh_engine.cu already compiles it, and a second include would duplicate every kernel.
 extern __global__ void k_ssm(float* state, const float* xc, int C_, const float* dt, int ld_dt, const float* dt_bias,
                              const float* A, const float* D, float* y, int H, int G, int T, bool write);
+extern __global__ void k_ssm_fast(float* state, const float* xc, int C_, const float* dt, int ld_dt,
+                                  const float* dt_bias, const float* A, const float* D, float* y, int H, int G, int T,
+                                  bool write);
 
 namespace {
 
@@ -188,7 +192,8 @@ void ssm_ws_free(SsmWs& ws) {
 void ssm_scan_seq(float* state, const float* xc, int C_, const float* dt, int ld_dt, const float* dt_bias,
                   const float* A, const float* D, float* y, int H, int G, int T, bool write, cudaStream_t st) {
     if (T <= 0) return;
-    k_ssm<<<H, 256, 0, st>>>(state, xc, C_, dt, ld_dt, dt_bias, A, D, y, H, G, T, write);
+    // k_ssm_fast: 8 warps cover 8 values of p, grid (8, H).  k_ssm (1 block / head) stays in the header unused.
+    k_ssm_fast<<<dim3(8, H), 256, 0, st>>>(state, xc, C_, dt, ld_dt, dt_bias, A, D, y, H, G, T, write);
 }
 
 void ssm_scan_ssd(float* state, const float* xc, int C_, const float* dt, int ld_dt, const float* dt_bias,
