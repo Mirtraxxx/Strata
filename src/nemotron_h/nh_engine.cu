@@ -1073,7 +1073,7 @@ struct Engine {
     /// out [T][n_out] = W [n_out][n_in] (f32) x: the router (FP32, as llama.cpp keeps it)
     void f32mm(const float* W, const float* xin, float* out, int n_in, int n_out, int T) {
         if (T <= kGemmT) {
-            k_gemv_f32<<<dim3(rows8(n_out), T), kThreads, 0, st>>>(W, xin, out, n_in, n_out);
+            k_gemv_f32<<<dim3((n_out + 15) / 16, T), 256, 0, st>>>(W, xin, out, n_in, n_out);
             return;
         }
         const int tm = n_out > 64 ? 4 : 1;
@@ -1388,8 +1388,8 @@ struct Engine {
             CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaMemcpyAsync(h_hl, hl, (size_t) T * LAT * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaEventRecord(ev_route, st));
-            k_group_hy<<<1, kThreads, 0, st>>>(ids, n_ent, Kp, E_, Hh.slot_of_d, M.slots, M.stride, grp_ptr, grp_start,
-                                               n_groups, ent_dst, ent_tok);
+            k_group_hy<<<1, 512, 0, st>>>(ids, n_ent, Kp, E_, Hh.slot_of_d, M.slots, M.stride, grp_ptr, grp_start,
+                                          n_groups, ent_dst, ent_tok);
             K::native_expert_grouped_relu2(M.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
                                            std::min<int64_t>(n_ent, E_), n_ent, xq_l, escr, eparts, st);
             shared(M, T);
@@ -1588,7 +1588,7 @@ struct Engine {
         }
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok, T, N, x, st);
         embed_inject(x, T, p0);
-        k_rms_ld<<<T, kThreads, 0, st>>>(x, N, m->layers[0].norm, h, N, N, g.eps);
+        k_rms_ld<<<T, kNormThreads, 0, st>>>(x, N, m->layers[0].norm, h, N, N, g.eps);
         const size_t nl = m->layers.size();
         if (dump_f) dump_buf.assign(nl * (size_t) T * N, 0.f);
         for (size_t l = 0; l < m->layers.size(); ++l) {
@@ -1607,15 +1607,15 @@ struct Engine {
             if (pfn) prefetch_begin(m->layers[l + 1], T);
             if (L.kind == Kind::Mamba) {
                 mamba(L, T, verify);
-                k_add_norm<<<T, kThreads, 0, st>>>(x, y, nullptr, wn, hout, N, g.eps, false);
+                k_add_norm<<<T, kNormThreads, 0, st>>>(x, y, nullptr, wn, hout, N, g.eps, false);
                 if (pfn) prefetch_issue(m->layers[l + 1], T);
             } else if (L.kind == Kind::Attn) {
                 attention(L, T, p0, pos0);
-                k_add_norm<<<T, kThreads, 0, st>>>(x, y, nullptr, wn, hout, N, g.eps, false);
+                k_add_norm<<<T, kNormThreads, 0, st>>>(x, y, nullptr, wn, hout, N, g.eps, false);
                 if (pfn) prefetch_issue(m->layers[l + 1], T);
             } else {
                 moe(L, T);
-                k_add_norm<<<T, kThreads, 0, st>>>(x, y, y2, wn, hout, N, g.eps, false);
+                k_add_norm<<<T, kNormThreads, 0, st>>>(x, y, y2, wn, hout, N, g.eps, false);
             }
             if (dump_f)
                 CK(cudaMemcpyAsync(dump_buf.data() + l * (size_t) T * N, x, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
@@ -1642,14 +1642,14 @@ struct Engine {
         if (T > hybrid_t) stream_plan({m->n_moe});
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok_m, T, N, y, st);
         embed_inject(y, T, p0);
-        k_rms_ld<<<T, kThreads, 0, st>>>(y, N, m->mtp_enorm, mtp_cat, 2 * N, N, g.eps);        // [e | ...]
-        k_rms_ld<<<T, kThreads, 0, st>>>(sd, N, m->mtp_hnorm, mtp_cat + N, 2 * N, N, g.eps);   // [... | h]
+        k_rms_ld<<<T, kNormThreads, 0, st>>>(y, N, m->mtp_enorm, mtp_cat, 2 * N, N, g.eps);        // [e | ...]
+        k_rms_ld<<<T, kNormThreads, 0, st>>>(sd, N, m->mtp_hnorm, mtp_cat + N, 2 * N, N, g.eps);   // [... | h]
         mm(m->eh_proj, mtp_cat, x, T);
-        k_rms_ld<<<T, kThreads, 0, st>>>(x, N, m->mtp_attn.norm, h, N, N, g.eps);
+        k_rms_ld<<<T, kNormThreads, 0, st>>>(x, N, m->mtp_attn.norm, h, N, N, g.eps);
         attention(m->mtp_attn, T, p0, pos0_m);
-        k_add_norm<<<T, kThreads, 0, st>>>(x, y, nullptr, m->mtp_post_norm, h, N, g.eps, false);
+        k_add_norm<<<T, kNormThreads, 0, st>>>(x, y, nullptr, m->mtp_post_norm, h, N, g.eps, false);
         moe(m->mtp_moe, T);
-        k_add_norm<<<T, kThreads, 0, st>>>(x, y, y2, m->mtp_shnorm, hmtp, N, g.eps, true);
+        k_add_norm<<<T, kNormThreads, 0, st>>>(x, y, y2, m->mtp_shnorm, hmtp, N, g.eps, true);
         if (T > hybrid_t) xs.finish();
         if (draft) head_rows(hmtp + (size_t) (T - 1) * N, 1, logits_m, pick_m);
     }
