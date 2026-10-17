@@ -7,6 +7,7 @@
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <type_traits>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -116,6 +117,101 @@ __global__ void dequantize_nvfp4_kernel(const block_nvfp4* __restrict__ vx, half
 
     yy[y0] = __float2half(v0);
     yy[y1] = __float2half(v1);
+}
+
+/// y [T][n_out] = W x for an NVFP4 weight [n_out][n_in] kept packed (64-element blocks along each row, tensor
+/// scale s) and T <= 8 FP16 rows x [T][n_in]: 8 warps a block, 4 output rows a warp, 8 lanes a row (one 64-block
+/// each per 512-column chunk of x, staged through shared memory with each block padded off the others' banks)
+__device__ __forceinline__ float ue4m3_to_fp32_fast(uint32_t x) {   // ue4m3_to_fp32 without ldexpf
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const uint32_t e = (x >> 3) & 0xF, mn = x & 0x7;
+    if (e == 0) return (float) mn * (1.0f / 1024.0f);
+    return __uint_as_float(((e + 119) << 23) | (mn << 20));   // (1 + mn/8) 2^(e-7) * 0.5
+}
+
+/// y [T][n_out] = W x for an NVFP4 weight [n_out][n_in] kept packed (64-element blocks along each row, tensor
+/// scale s) and T <= 8 FP16 rows x [T][n_in]: 8 warps a block, 4 output rows a warp, 8 lanes a row (one 64-block
+/// each per 512-column chunk of x, staged through shared memory, each block's 64 columns padded to 72 so the 8
+/// lanes of a 16-byte load phase hit all 32 banks once).  FP32 math throughout (FP16 sums overflow on the drafter's
+/// activations).
+template <typename TOut, int LPR>
+__global__ void __launch_bounds__(256) nvfp4_mm8_kernel(const block_nvfp4* __restrict__ W, float s,
+                                                        const half* __restrict__ x, TOut* __restrict__ y, int n_in,
+                                                        int n_out, int T) {
+    constexpr int kChunk = LPR * QK_NVFP4, kPad = QK_NVFP4 + 8;
+    __shared__ __align__(16) half xs[8][LPR * kPad];
+    __shared__ float lut[16];   // the FP4 values (constant memory would serialize the lanes' different indices)
+    if (threadIdx.x < 16) lut[threadIdx.x] = c_kvalues_fp4[threadIdx.x];
+    const int lane = threadIdx.x % 32;
+    const int row = blockIdx.x * (8 * 32 / LPR) + (threadIdx.x / 32) * (32 / LPR) + lane / LPR;
+    const int sub = lane % LPR;
+    const int nb_row = n_in / QK_NVFP4;
+    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (int c0 = 0; c0 < n_in; c0 += kChunk) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < 8 * kChunk / 8; i += blockDim.x) {   // 16-byte pieces
+            const int t = i / (kChunk / 8), j = (i % (kChunk / 8)) * 8;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (t < T && c0 + j < n_in) v = *reinterpret_cast<const uint4*>(x + (size_t) t * n_in + c0 + j);
+            *reinterpret_cast<uint4*>(&xs[t][(j / QK_NVFP4) * kPad + j % QK_NVFP4]) = v;
+        }
+        __syncthreads();
+        const int b = c0 / QK_NVFP4 + sub;
+        if (row >= n_out || b >= nb_row) continue;
+        const uint32_t* wp = reinterpret_cast<const uint32_t*>(W + (size_t) row * nb_row + b);   // 36 bytes, 4-aligned
+        uint32_t w[9];
+#pragma unroll
+        for (int i = 0; i < 9; ++i) w[i] = __ldg(wp + i);
+#pragma unroll
+        for (int sb = 0; sb < 4; ++sb) {
+            const float d = ue4m3_to_fp32_fast((w[0] >> (8 * sb)) & 0xFF) * s;
+            // element e < 8: byte e's low nibble; e >= 8: byte e-8's high nibble.  Pair k = elements 2k, 2k+1.
+            float2 wv[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int e0 = 2 * k, e1 = 2 * k + 1;
+                const uint32_t b0 = (w[1 + sb * 2 + (e0 % 8) / 4] >> (8 * ((e0 % 8) % 4))) & 0xFF;
+                const uint32_t b1 = (w[1 + sb * 2 + (e1 % 8) / 4] >> (8 * ((e1 % 8) % 4))) & 0xFF;
+                const uint32_t q0 = e0 < 8 ? (b0 & 0xF) : (b0 >> 4), q1 = e1 < 8 ? (b1 & 0xF) : (b1 >> 4);
+                wv[k] = make_float2(lut[q0], lut[q1]);
+            }
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                const uint4* xr = reinterpret_cast<const uint4*>(&xs[t][sub * kPad + sb * 16]);
+                const uint4 xa = xr[0], xb = xr[1];
+                const half2* ha = reinterpret_cast<const half2*>(&xa);
+                const half2* hb = reinterpret_cast<const half2*>(&xb);
+                float dot = 0.f;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const float2 fa = __half22float2(ha[k]), fb = __half22float2(hb[k]);
+                    dot = fmaf(wv[k].x, fa.x, fmaf(wv[k].y, fa.y, dot));
+                    dot = fmaf(wv[k + 4].x, fb.x, fmaf(wv[k + 4].y, fb.y, dot));
+                }
+                acc[t] = fmaf(d, dot, acc[t]);
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        acc[t] += __shfl_xor_sync(0xffffffffu, acc[t], 1);
+        acc[t] += __shfl_xor_sync(0xffffffffu, acc[t], 2);
+        acc[t] += __shfl_xor_sync(0xffffffffu, acc[t], 4);
+        if (LPR == 16) acc[t] += __shfl_xor_sync(0xffffffffu, acc[t], 8);
+    }
+    if (sub != 0 || row >= n_out) return;
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {   // constant indices: acc stays in registers
+        if (t >= T) break;
+        if constexpr (std::is_same<TOut, half>::value) y[(size_t) t * n_out + row] = __float2half(acc[t]);
+        else y[(size_t) t * n_out + row] = acc[t];
+    }
+}
+
+template <typename TOut>
+static void nvfp4_mm8(const block_nvfp4* W, float s, const half* x, TOut* y, int n_in, int n_out, int T,
+                      cudaStream_t stream) {
+    nvfp4_mm8_kernel<TOut, 16><<<(n_out + 15) / 16, 256, 0, stream>>>(W, s, x, y, n_in, n_out, T);
 }
 
 __global__ void dequantize_nvfp4_f32_kernel(const block_nvfp4* __restrict__ vx, float* __restrict__ yy, int64_t ne, float tensor_scale) {
@@ -975,9 +1071,10 @@ struct DFlashDrafter::Impl {
         float* ffn_norm = nullptr; // [4096]
         half* ffn_conv_proj = nullptr; // [4096, 1024]
         float* ffn_conv_base = nullptr; // [4096, 2, 2]
-        half* ffn_gate = nullptr; // [4096, 12288]
-        half* ffn_up = nullptr; // [4096, 12288]
-        half* ffn_down = nullptr; // [12288, 4096]
+        block_nvfp4* ffn_gate = nullptr; // [4096, 12288], NVFP4 kept packed (nvfp4_mm8)
+        block_nvfp4* ffn_up = nullptr; // [4096, 12288]
+        block_nvfp4* ffn_down = nullptr; // [12288, 4096]
+        float ffn_gate_s = 1.0f, ffn_up_s = 1.0f, ffn_down_s = 1.0f; // their tensor scales
     };
     std::vector<LayerWeights> layers;
     float* d_output_norm = nullptr; // [4096]
@@ -1308,6 +1405,20 @@ bool DFlashDrafter::load(const std::string& dflash_gguf_path,
             CUDA_CHECK(cudaFree(d_raw));
         };
 
+        auto load_nvfp4_packed = [&](const std::string& name, const std::string& scale_name, block_nvfp4*& d_ptr,
+                                     float& scale_val, int64_t n_elems) {
+            size_t s = 0;
+            const strata::TensorInfo* t = gm_dft.find(name, &s);
+            if (!t) throw std::runtime_error("missing tensor: " + name);
+            scale_val = 1.0f;
+            size_t ss = 0;
+            if (const strata::TensorInfo* ts = gm_dft.find(scale_name, &ss))
+                std::memcpy(&scale_val, gm_dft.shard(ss).tensor_data(*ts), sizeof(float));
+            const size_t raw_bytes = (size_t) (n_elems / QK_NVFP4) * sizeof(block_nvfp4);
+            CUDA_CHECK(cudaMalloc(&d_ptr, raw_bytes));
+            CUDA_CHECK(cudaMemcpy(d_ptr, gm_dft.shard(s).tensor_data(*t), raw_bytes, cudaMemcpyHostToDevice));
+        };
+
         auto load_nvfp4_f32 = [&](const std::string& name, const std::string& scale_name, float*& d_ptr, int64_t n_elems) {
             size_t s = 0;
             const strata::TensorInfo* t = gm_dft.find(name, &s);
@@ -1381,9 +1492,9 @@ bool DFlashDrafter::load(const std::string& dflash_gguf_path,
             load_f32(p + "ffn_norm.weight", l.ffn_norm, impl_->cfg.n_embd);
             load_bf16(p + "ffn_conv_proj.weight", l.ffn_conv_proj, (int64_t) impl_->cfg.n_embd * 1024);
             load_f32(p + "ffn_conv_base", l.ffn_conv_base, (int64_t) impl_->cfg.n_embd * 2 * 2);
-            load_nvfp4(p + "ffn_gate.weight", p + "ffn_gate.scale", l.ffn_gate, (int64_t) impl_->cfg.n_embd * impl_->cfg.n_ff);
-            load_nvfp4(p + "ffn_up.weight", p + "ffn_up.scale", l.ffn_up, (int64_t) impl_->cfg.n_embd * impl_->cfg.n_ff);
-            load_nvfp4(p + "ffn_down.weight", p + "ffn_down.scale", l.ffn_down, (int64_t) impl_->cfg.n_ff * impl_->cfg.n_embd);
+            load_nvfp4_packed(p + "ffn_gate.weight", p + "ffn_gate.scale", l.ffn_gate, l.ffn_gate_s, (int64_t) impl_->cfg.n_embd * impl_->cfg.n_ff);
+            load_nvfp4_packed(p + "ffn_up.weight", p + "ffn_up.scale", l.ffn_up, l.ffn_up_s, (int64_t) impl_->cfg.n_embd * impl_->cfg.n_ff);
+            load_nvfp4_packed(p + "ffn_down.weight", p + "ffn_down.scale", l.ffn_down, l.ffn_down_s, (int64_t) impl_->cfg.n_ff * impl_->cfg.n_embd);
         }
         load_f32("output_norm.weight", impl_->d_output_norm, impl_->cfg.n_embd);
 
@@ -1785,20 +1896,10 @@ std::vector<int32_t> DFlashDrafter::draft(int32_t id_last,
         if (il == 0) check_nan("draft: l0 d_ffn_conv_in", d_ffn_conv_in, (size_t) m.cfg.n_embd * block_size, stream);
 
         // SwiGLU FFN: gate & up
-        CUBLAS_CHECK(cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                                 m.cfg.n_ff, block_size, m.cfg.n_embd,
-                                 &alpha, l.ffn_gate, CUDA_R_16F, m.cfg.n_embd,
-                                 d_ffn_conv_in, CUDA_R_16F, m.cfg.n_embd,
-                                 &beta, d_gate, CUDA_R_16F, m.cfg.n_ff,
-                                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        nvfp4_mm8(l.ffn_gate, l.ffn_gate_s, d_ffn_conv_in, d_gate, m.cfg.n_embd, m.cfg.n_ff, block_size, stream);
         if (il == 0) check_nan("draft: l0 d_gate", d_gate, (size_t) m.cfg.n_ff * block_size, stream);
 
-        CUBLAS_CHECK(cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                                 m.cfg.n_ff, block_size, m.cfg.n_embd,
-                                 &alpha, l.ffn_up, CUDA_R_16F, m.cfg.n_embd,
-                                 d_ffn_conv_in, CUDA_R_16F, m.cfg.n_embd,
-                                 &beta, d_up, CUDA_R_16F, m.cfg.n_ff,
-                                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        nvfp4_mm8(l.ffn_up, l.ffn_up_s, d_ffn_conv_in, d_up, m.cfg.n_embd, m.cfg.n_ff, block_size, stream);
         if (il == 0) check_nan("draft: l0 d_up", d_up, (size_t) m.cfg.n_ff * block_size, stream);
 
         // SiLU(gate) * up
@@ -1807,12 +1908,7 @@ std::vector<int32_t> DFlashDrafter::draft(int32_t id_last,
         if (il == 0) check_nan("draft: l0 swiglu", d_gate, (size_t) m.cfg.n_ff * block_size, stream);
 
         // FFN down: half d_gate -> F32 d_ffn_out
-        CUBLAS_CHECK(cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                                 m.cfg.n_embd, block_size, m.cfg.n_ff,
-                                 &alpha, l.ffn_down, CUDA_R_16F, m.cfg.n_ff,
-                                 d_gate, CUDA_R_16F, m.cfg.n_ff,
-                                 &beta, d_ffn_out, CUDA_R_32F, m.cfg.n_embd,
-                                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        nvfp4_mm8(l.ffn_down, l.ffn_down_s, d_gate, d_ffn_out, m.cfg.n_ff, m.cfg.n_embd, block_size, stream);
         if (il == 0) check_nan_f32("draft: l0 d_ffn_out", d_ffn_out, (size_t) m.cfg.n_embd * block_size, stream);
 
         // FFN conv out (side = 1): F32 d_ffn_out -> F32 d_ffn_conv_out
