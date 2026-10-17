@@ -56,6 +56,118 @@ static std::vector<uint8_t> make_blocks(const Type& t, int64_t rows, int64_t col
     return b;
 }
 
+// NVFP4 blocks are 36 bytes per 64 values, not the K-quant pack above.  Mode 0 is dequant_kernel<40>, mode 1 the
+// 16-value kernel.  Shapes include Bolt's in_proj (18560 x 4096) and out_proj (4096 x 8192).
+static std::vector<uint8_t> make_nvfp4(int64_t rows, int64_t cols, bool sane, uint32_t seed) {
+    std::mt19937 rng(seed);
+    const int64_t nb = rows * (cols / 64);
+    std::vector<uint8_t> b((size_t) nb * 36);
+    for (size_t i = 0; i + 4 <= b.size(); i += 4) {
+        const uint32_t r = rng();
+        std::memcpy(&b[i], &r, 4);
+    }
+    for (size_t i = b.size() & ~(size_t) 3; i < b.size(); ++i) b[i] = (uint8_t) rng();
+    if (!sane) return b;
+    for (int64_t k = 0; k < nb; ++k) {
+        uint8_t* p = b.data() + (size_t) k * 36;
+        for (int s = 0; s < 4; ++s) {
+            const unsigned exp = 1u + (rng() % 14u);
+            const unsigned man = rng() % 8u;
+            const unsigned sign = rng() & 1u;
+            p[s] = (uint8_t) ((sign << 7) | (exp << 3) | man);
+        }
+    }
+    return b;
+}
+
+static void nvfp4_cases(cudaStream_t s, bool bench, int& cases, int& failures) {
+    struct Shape { int64_t rows, cols; bool full; };
+    const Shape shapes[] = {{1, 64, true}, {3, 128, true}, {7, 4096, true}, {4, 18560, true}, {2, 8192, true},
+                            {18560, 4096, false}, {4096, 8192, false}};
+    for (const Shape& sh : shapes) {
+        for (int sane = 1; sane >= 0; --sane) {
+            const int64_t rows = sh.rows, cols = sh.cols;
+            const std::vector<uint8_t> hb = make_nvfp4(rows, cols, sane != 0, (uint32_t) (40 * 1000003 + rows * 31 + cols + sane));
+            uint8_t* db = nullptr;
+            ck(cudaMalloc((void**) &db, hb.size()), "nvfp4 blocks");
+            ck(cudaMemcpy(db, hb.data(), hb.size(), cudaMemcpyHostToDevice), "nvfp4 upload");
+            const int64_t ldp = cols + 64;
+            const size_t cap = (size_t) rows * (size_t) ldp * 4;
+            uint8_t *o0 = nullptr, *o1 = nullptr;
+            ck(cudaMalloc((void**) &o0, cap), "nvfp4 out0");
+            ck(cudaMalloc((void**) &o1, cap), "nvfp4 out1");
+            std::vector<uint8_t> h0(cap), h1(cap);
+            const int whats[] = {0, 1, 2, 3, 4};
+            for (int what : whats) {
+                if (!sh.full && what != 0 && what != 3) continue;   // weight shapes: FP16 and the padded stride
+                const int64_t r0 = what == 4 ? rows / 3 : 0, nr = what == 4 ? rows - rows / 3 - rows / 5 : rows;
+                if (nr <= 0) continue;
+                for (int vec = 0; vec < 2; ++vec) {
+                    uint8_t* o = vec ? o1 : o0;
+                    ck(cudaMemsetAsync(o, 0xA5, cap, s), "nvfp4 memset");
+                    K::dequant_set_nvfp4_vec(vec);
+                    if (what == 0 || what == 4) K::dequant_f16(40, db, r0, nr, cols, (uint16_t*) o, s);
+                    else if (what == 1) K::dequant_bf16(40, db, r0, nr, cols, (uint16_t*) o, s);
+                    else if (what == 2) K::dequant_f32(40, db, r0, nr, cols, (float*) o, s);
+                    else if (!K::dequant_f16_ld(40, db, r0, nr, cols, ldp, (uint16_t*) o, s)) {
+                        std::printf("FAIL NVFP4: dequant_f16_ld refused\n");
+                        ++failures;
+                    }
+                    ck(cudaMemcpyAsync(vec ? h1.data() : h0.data(), o, cap, cudaMemcpyDeviceToHost, s), "nvfp4 download");
+                }
+                ck(cudaStreamSynchronize(s), "nvfp4 sync");
+                ++cases;
+                if (std::memcmp(h0.data(), h1.data(), cap) != 0) {
+                    size_t nd = 0, first = 0;
+                    for (size_t i = 0; i < cap; ++i) if (h0[i] != h1[i]) { if (!nd) first = i; ++nd; }
+                    std::printf("FAIL NVFP4 %lldx%lld %s what %d: %zu bytes differ, first at %zu\n", (long long) rows,
+                                (long long) cols, sane ? "sane" : "raw", what, nd, first);
+                    ++failures;
+                }
+                if (what == 3) {
+                    size_t bad = 0;
+                    for (int64_t r = 0; r < nr; ++r)
+                        for (int64_t c = cols; c < ldp; ++c)
+                            if (h1[(size_t) (r * ldp + c) * 2] != 0xA5 || h1[(size_t) (r * ldp + c) * 2 + 1] != 0xA5) ++bad;
+                    if (bad) {
+                        std::printf("FAIL NVFP4 %lldx%lld: vector kernel wrote %zu values into the row padding\n",
+                                    (long long) rows, (long long) cols, bad);
+                        ++failures;
+                    }
+                }
+            }
+            if (bench && sane && (rows == 18560 || rows == 4096)) {
+                cudaEvent_t e0, e1;
+                cudaEventCreate(&e0);
+                cudaEventCreate(&e1);
+                double ms[2] = {0, 0};
+                const int reps = 20;
+                for (int vec = 0; vec < 2; ++vec) {
+                    K::dequant_set_nvfp4_vec(vec);
+                    for (int i = 0; i < 3; ++i) K::dequant_f16(40, db, 0, rows, cols, (uint16_t*) o0, s);
+                    cudaEventRecord(e0, s);
+                    for (int i = 0; i < reps; ++i) K::dequant_f16(40, db, 0, rows, cols, (uint16_t*) o0, s);
+                    cudaEventRecord(e1, s);
+                    ck(cudaEventSynchronize(e1), "nvfp4 bench sync");
+                    float tms = 0;
+                    cudaEventElapsedTime(&tms, e0, e1);
+                    ms[vec] = tms / reps;
+                }
+                const double bytes = (double) hb.size() + (double) rows * (double) cols * 2.0;
+                std::printf("BENCH NVFP4 %6lldx%-6lld scalar %8.3f ms (%5.1f GB/s) | vec %8.3f ms (%5.1f GB/s) | %.2fx\n",
+                            (long long) rows, (long long) cols, ms[0], bytes / ms[0] / 1e6, ms[1], bytes / ms[1] / 1e6,
+                            ms[0] / ms[1]);
+                cudaEventDestroy(e0);
+                cudaEventDestroy(e1);
+            }
+            cudaFree(db);
+            cudaFree(o0);
+            cudaFree(o1);
+        }
+    }
+    K::dequant_set_nvfp4_vec(-1);
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     const bool bench = argc > 1 && std::string(argv[1]) == "--bench";
@@ -139,7 +251,9 @@ int main(int argc, char** argv) {
             }
         }
     }
+    nvfp4_cases(s, bench, cases, failures);
     K::dequant_set_wide(-1);
+    K::dequant_set_nvfp4_vec(-1);
     std::printf("dequant_wide_parity: %d cases, %s\n", cases, failures ? "FAILED" : "OK (bitwise)");
     return failures ? 1 : 0;
 }
