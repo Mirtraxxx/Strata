@@ -19,7 +19,8 @@
 //   * images (GENI): strata-vision's rows (llama.cpp mtmd, the mmproj's RADIO tower + projector) in place of the
 //     prompt's <image> tokens (the server writes <img> <image> x n </img>).
 //
-// Modes: --serve (serve/server.py's engine protocol: READY / GEN / GENI / T / DONE / STOP / PP), --tokens IDS [--n N]
+// Modes: --serve (serve/server.py's engine protocol: READY / GEN / GENI / T / DONE / STOP / PP, and VRAM for
+// POST /v1/vram), --tokens IDS [--n N]
 // [--force IDS] [--dump-full-logits F] (tools/nemotron_h's parity interface), --bench-pp N / --bench-tg N.
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -156,6 +157,7 @@ constexpr int kImagePad = 18;          // <image>: the rows strata-vision's embe
 constexpr int kEos = 11;               // <|im_end|> (tokenizer.ggml.eos_token_id)
 constexpr int kEos2 = 2;               // </s>
 constexpr size_t kTail = 4096;         // zeroed bytes after the last slot (a kernel reading a little past a matrix)
+constexpr size_t kAllocGran = (size_t) 2 << 20;   // the slot buffers' planned cudaMalloc rounding
 
 // ------------------------------------------------------------------------------------------------ the model
 struct Mat {
@@ -827,6 +829,12 @@ struct Engine {
     bool warming = false;
     int adapt_every = 32, adapt_swaps = 8;   // --adapt-every / --adapt-swaps: the decode's slot replacements
     int swaps_after_prompt = 512;
+    // POST /v1/vram (the server's `VRAM <reserve_mib>`): the startup slot count is the ceiling.  A shrink frees
+    // slots, a regrow refills them up to that ceiling.  Dense weights, the KV cache and vram_reserve_mib stay.
+    int vram_reserve_mib = 1024;
+    int slots_cap = 0, slots_now = 0;
+    int prompt_chunk = 2048;
+    std::vector<Moe*> vram_moe;
     // GENI: rows that replace the embedding of an absolute position (host floats, N each)
     std::map<int64_t, const float*> inject;
     // --dump-layers: every main forward's sublayer outputs (the residual x), [pos][layer][N] f32 (parity.py)
@@ -1553,6 +1561,16 @@ struct Engine {
 };
 
 // ------------------------------------------------------------------------------------------------ expert placement
+/// Bytes cudaMalloc takes for `s` slots on every MoE layer (one buffer per layer, 2 MiB rounding, the tail included).
+size_t slots_bytes(const std::vector<Moe*>& all, int s) {
+    size_t b = 0;
+    for (Moe* M : all) {
+        const size_t nb = (size_t) std::max(std::min(M->E, s), 1) * M->stride + kTail;
+        b += (nb + kAllocGran - 1) & ~(kAllocGran - 1);
+    }
+    return b;
+}
+
 /// MemAvailable from /proc/meminfo in bytes (0 when unknown).
 size_t mem_available() {
 #if defined(_WIN32)
@@ -1707,15 +1725,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int slots,
     const size_t reserve = (size_t) std::max(256, reserve_mib) << 20;   // --vram-reserve-mib (the server's: 700)
     const size_t target_free = reserve + ((size_t) 32 << 20);           // headroom for runtime/desktop jitter
     const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30)) : (fr > target_free ? fr - target_free : 0);
-    constexpr size_t kAllocGran = (size_t) 2 << 20;
-    auto vram_for = [&](int s) {
-        size_t b = 0;
-        for (Moe* M : all) {
-            const size_t nb = (size_t) std::max(std::min(M->E, s), 1) * M->stride + kTail;
-            b += (nb + kAllocGran - 1) & ~(kAllocGran - 1);
-        }
-        return b;
-    };
+    auto vram_for = [&](int s) { return slots_bytes(all, s); };
     int S_ = 0;
     if (slots > 0) {
         S_ = std::min(g.E, slots);
@@ -1801,6 +1811,187 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int slots,
                      (double) E.xs.nr * max_stride / (1 << 30), (double) fr / (1 << 30), fr >> 20, ms_since(t0) / 1000.0);
     (void) ring;
     (void) err;
+    E.vram_moe = all;
+    E.slots_cap = std::max(S_, 1);
+    E.slots_now = S_;
+    E.vram_reserve_mib = std::max(256, reserve_mib);
+    std::fprintf(stderr, "strata-nh: elastic VRAM: POST /v1/vram frees or refills expert slots "
+                         "(dense weights, the KV cache and %d MiB stay)\n", E.vram_reserve_mib);
+    return true;
+}
+
+/// Put `S` slots on every layer (capped by that layer's expert count).  The kept experts are the hottest by the
+/// router statistics (the decayed score, then the lifetime count, then whoever is already resident).  The old
+/// buffers are freed before the new ones are allocated: a shrink is asked for when both would not fit.
+bool set_slots_once(Engine& E, int S, std::string& err) {
+    auto fail = [&](cudaError_t e, const char* what) {
+        if (e == cudaSuccess) return false;
+        err = std::string("VRAM: ") + what + ": " + cudaGetErrorString(e);
+        (void) cudaGetLastError();
+        return true;
+    };
+    // A previous failed resize may have left a sticky error.  Drop it: this call rebuilds the slot buffers.
+    (void) cudaDeviceSynchronize();
+    (void) cudaGetLastError();
+    E.xs.finish();
+    for (Moe* M : E.vram_moe) {
+        if (M->slots != nullptr) {
+            cudaFree(M->slots);
+            M->slots = nullptr;
+        }
+        M->n_slots = 0;
+    }
+    (void) cudaGetLastError();
+    std::vector<uint8_t*> fresh(E.vram_moe.size(), nullptr);
+    for (size_t mi = 0; mi < E.vram_moe.size(); ++mi) {
+        Moe* M = E.vram_moe[mi];
+        const int ns = std::min(M->E, S);
+        const size_t nb = (size_t) std::max(ns, 1) * M->stride + kTail;
+        const cudaError_t e = cudaMalloc((void**) &fresh[mi], nb);
+        if (e != cudaSuccess) {
+            err = std::string("VRAM: cudaMalloc: ") + cudaGetErrorString(e);
+            (void) cudaGetLastError();
+            for (uint8_t* p : fresh)
+                if (p) cudaFree(p);
+            return false;
+        }
+        if (fail(cudaMemset(fresh[mi], 0, nb), "cudaMemset")) {
+            for (uint8_t* p : fresh)
+                if (p) cudaFree(p);
+            return false;
+        }
+    }
+    for (size_t mi = 0; mi < E.vram_moe.size(); ++mi) {
+        Moe& M = *E.vram_moe[mi];
+        const int ne = M.E, ns = std::min(ne, S);
+        M.slots = fresh[mi];
+        M.n_slots = ns;
+        Engine::Hy& H = E.hy[mi];
+        if ((int) H.score.size() < ne || (int) H.total.size() < ne || H.slot_of_d == nullptr) {
+            err = "VRAM: the router statistics are missing";
+            return false;
+        }
+        std::vector<char> was((size_t) ne, 0);
+        if ((int) H.slot_of.size() == ne)
+            for (int x = 0; x < ne; ++x) was[(size_t) x] = H.slot_of[(size_t) x] >= 0 ? 1 : 0;
+        std::vector<int> order((size_t) ne);
+        for (int x = 0; x < ne; ++x) order[(size_t) x] = x;
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+            const double sa = H.score[(size_t) a], sb = H.score[(size_t) b];
+            if (sa != sb) return sa > sb;
+            const double ta = H.total[(size_t) a], tb = H.total[(size_t) b];
+            if (ta != tb) return ta > tb;
+            if (was[(size_t) a] != was[(size_t) b]) return was[(size_t) a] > was[(size_t) b];
+            return a < b;
+        });
+        H.slot_of.assign((size_t) ne, -1);
+        H.exp_in_slot.assign((size_t) std::max(ns, 0), 0);
+        for (int s = 0; s < ns; ++s) {
+            const int x = order[(size_t) s];
+            H.slot_of[(size_t) x] = s;
+            H.exp_in_slot[(size_t) s] = x;
+            uint8_t* dst = M.slots + (size_t) s * M.stride;
+            if (fail(cudaMemcpyAsync(dst, M.up_of(x), M.up_bytes, cudaMemcpyHostToDevice, E.st), "expert upload") ||
+                fail(cudaMemcpyAsync(dst + M.L.down_off, M.down_of(x), M.d_bytes, cudaMemcpyHostToDevice, E.st),
+                     "expert upload"))
+                return false;
+        }
+        if (fail(cudaMemcpyAsync(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice, E.st),
+                 "slot table"))
+            return false;
+    }
+    if (fail(cudaStreamSynchronize(E.st), "cudaStreamSynchronize")) return false;
+    E.slots_now = S;
+    return true;
+}
+
+bool set_slots(Engine& E, int S, std::string& err) {
+    S = std::max(1, std::min(S, std::max(E.slots_cap, 1)));
+    if (set_slots_once(E, S, err)) return true;
+    if (S == 1) return false;
+    const std::string why = err;
+    std::string kept;
+    if (!set_slots_once(E, 1, kept)) {
+        if (!kept.empty()) err = why + "; " + kept;
+        return false;
+    }
+    std::fprintf(stderr, "strata-nh: VRAM resize to %d slots a layer failed (%s); kept 1\n", S, why.c_str());
+    err.clear();
+    return true;
+}
+
+/// `VRAM` or `VRAM <reserve_mib>` between requests.  Prints one `VRAM k=v ...` line on success (the server's
+/// POST /v1/vram shape).  A bare command uses the reserve the engine started with.
+bool vram_command(Engine& E, const std::string& cmd, std::string& err) {
+    if (E.vram_moe.empty() || E.slots_cap <= 0) {
+        err = "VRAM: this engine has no expert slots to resize";
+        return false;
+    }
+    const bool bare = cmd.find_first_not_of(' ', 4) == std::string::npos;
+    char* end = nullptr;
+    const long long reserve = bare ? (long long) E.vram_reserve_mib : std::strtoll(cmd.c_str() + 4, &end, 10);
+    if (!bare) {
+        if (end == cmd.c_str() + 4 || reserve < 0) {
+            err = "expected: VRAM [reserve_mib]";
+            return false;
+        }
+        while (*end == ' ') ++end;
+        if (*end != '\0') {
+            err = "expected: VRAM [reserve_mib]";
+            return false;
+        }
+    }
+    const auto t0 = Clock::now();
+    const int before = E.slots_now;
+    // Below the startup margin the cache only refills to the size it was given at start (that size already
+    // leaves the margin).  Above it, slots are dropped until the measured free VRAM covers the request.
+    int S = E.slots_now;
+    if (reserve <= (long long) E.vram_reserve_mib) {
+        S = E.slots_cap;
+    } else {
+        size_t fr = 0, tot = 0;
+        vram_info(fr, tot);
+        const size_t cur = slots_bytes(E.vram_moe, E.slots_now);
+        const size_t want = (size_t) reserve << 20;
+        const size_t guard = (size_t) 256 << 20;
+        const size_t budget = fr + cur > want + guard ? fr + cur - want - guard : 0;
+        int t = 0;
+        while (t < E.slots_cap && slots_bytes(E.vram_moe, t + 1) <= budget) ++t;
+        S = std::max(1, t);
+    }
+    if (S != E.slots_now && !set_slots(E, S, err)) return false;
+    size_t fr = 0, tot = 0;
+    vram_info(fr, tot);
+    const size_t target = (size_t) std::max(reserve, (long long) E.vram_reserve_mib) << 20;
+    std::string note;
+    for (int spins = 0; fr < target && E.slots_now > 1 && spins < 6; ++spins) {
+        size_t step = 0;
+        for (Moe* M : E.vram_moe)
+            if (M->E >= E.slots_now) step += M->stride;
+        if (step == 0) step = 1;
+        const int drop = std::max(1, (int) (((target - fr) + step - 1) / step));
+        const int next = std::max(1, E.slots_now - drop);
+        if (next == E.slots_now) break;
+        if (!set_slots(E, next, err)) return false;
+        vram_info(fr, tot);
+        note = " (trimmed until the reserve held)";
+    }
+    if (fr < ((size_t) reserve << 20)) note = " (the cache keeps its smallest size)";
+    long long slots = 0, full = 0;
+    for (Moe* M : E.vram_moe) {
+        slots += M->n_slots;
+        full += std::min(M->E, E.slots_cap);
+    }
+    const long long cache_mib = (long long) (slots_bytes(E.vram_moe, std::max(E.slots_now, 1)) >> 20);
+    const long long full_mib = (long long) (slots_bytes(E.vram_moe, E.slots_cap) >> 20);
+    std::fprintf(stderr, "strata-nh: VRAM %lld MiB kept free: expert slots %d -> %d of %d per layer "
+                         "(%lld of %lld slots, %lld of %lld MiB), %zu MiB free now, in %.0f ms%s\n",
+                 reserve, before, E.slots_now, E.slots_cap, slots, full, cache_mib, full_mib, fr >> 20,
+                 ms_since(t0), note.c_str());
+    std::printf("VRAM reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld expert_cache_mib=%lld "
+                "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld\n",
+                reserve, slots, full, cache_mib, full_mib, (long long) (fr >> 20), (long long) E.prompt_chunk);
+    std::fflush(stdout);
     return true;
 }
 
@@ -1926,6 +2117,16 @@ int serve(Engine& E) {
             lines.pop_front();
         }
         if (line.empty()) continue;
+        // Between requests only: a VRAM line that arrives during a GEN sits in this queue until DONE, so a shrink
+        // cannot run against a generation in progress (the server also holds its FIFO until that generation ends).
+        if (line == "VRAM" || line.rfind("VRAM ", 0) == 0) {
+            std::string e;
+            if (!vram_command(E, line, e)) {
+                std::printf("ERR %s\n", e.c_str());
+                std::fflush(stdout);
+            }
+            continue;
+        }
         const bool geni = line.rfind("GENI ", 0) == 0;
         if (!geni && line.rfind("GEN ", 0) != 0) {
             std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...> or GENI <max_new> [key=value ...] <file> "
@@ -2179,6 +2380,8 @@ int strata::nemotron_h::run(int argc, char** argv) {
         else if (a == "--adapt-swaps") adapt_swaps = std::max(0, std::atoi(next().c_str()));
         else if (a == "--expert-profile-save") profile_save = next();
         else if (a == "--vram-reserve-mib") reserve_mib = std::atoi(next().c_str());
+        else if (a == "--vram-elastic") {}   // the server's flag: slots resize on VRAM, there is no segment map
+        else if (a == "--vram-segment-mib") (void) next();
         else if (a == "--vision") {}   // the server's: images come as GENI requests, which this engine always takes
         else if (serve_mode && a.rfind("--", 0) == 0) {
             const bool val = i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0;
@@ -2226,6 +2429,7 @@ int strata::nemotron_h::run(int argc, char** argv) {
     E.adapt_swaps = adapt_swaps;
     (void) pin;
     E.init(m, ctx, chunk, ring);
+    E.prompt_chunk = chunk;
     if (!place_experts(m, E, expert_vram, cpu_threads, expert_slots, ring, arena, reserve_mib, profile, err)) {
         std::fprintf(stderr, "strata-nh: %s\n", err.c_str());
         return 1;

@@ -44,6 +44,19 @@ class Tekken(unittest.TestCase):
         t = self.tok("qwen35")
         self.assertEqual(t.encode("abc"), [256, ord("c")])  # BPE: "ab" + "c"
 
+    def test_pixtral_digits_are_one_token(self):
+        # Bolt's pre is pixtral (llama3): "17" is one piece, and ignore_merges keeps the vocab entry.
+        # qwen35 splits each digit, and there is no merge of "1" + "7", so it stays two tokens.
+        tokens = [ST.BYTE_TO_UNICODE[b] for b in range(256)] + ["17", "abc", "<|im_end|>"]
+        types = [1] * 258 + [3]
+        pix = ST.Tokenizer(tokens, ["a b"], types, "pixtral")
+        qwen = ST.Tokenizer(tokens, ["a b"], types, "qwen35")
+        self.assertTrue(pix.ignore_merges)
+        self.assertFalse(qwen.ignore_merges)
+        self.assertEqual(pix.encode("17"), [256])
+        self.assertEqual(qwen.encode("17"), [ord("1"), ord("7")])
+        self.assertEqual(pix.decode(pix.encode("17")), "17")
+
     def test_stop_ids_one_token_only(self):
         t = self.tok("tekken")
         self.assertEqual(t.encode("<|endoftext|>", parse_special=True)[:1], [ord("<")])   # pieces, not one token

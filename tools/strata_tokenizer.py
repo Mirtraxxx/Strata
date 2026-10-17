@@ -76,8 +76,25 @@ TEKKEN_PATTERN = (
     r"|\s+(?!\S)"
     r"|\s+"
 )
-PRE_PATTERNS = {"qwen35": QWEN35_PATTERN, "tekken": TEKKEN_PATTERN}
-IGNORE_MERGES = {"tekken"}
+# llama.cpp's LLAMA_VOCAB_PRE_TYPE_LLAMA3 (llama-vocab.cpp), including `pre` = pixtral: Nemotron 3.5 Bolt's
+# tokenizer.  Digits stay in groups of 1..3 and a combining mark is not part of the word (qwen35 does the opposite).
+# These pres also set ignore_merges.  llama.cpp's default for them prepends BOS, unless the GGUF key
+# tokenizer.ggml.add_bos_token says otherwise; encode() does not prepend it (decode(encode(s)) would keep it).
+LLAMA3_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+LLAMA3_PRE = frozenset({
+    "llama3", "llama-v3", "llama-bpe", "falcon3", "falcon-h1", "pixtral",
+    "midm-2.0", "lfm2", "jina-v5-nano",
+})
+PRE_PATTERNS = {"qwen35": QWEN35_PATTERN, "tekken": TEKKEN_PATTERN, **{p: LLAMA3_PATTERN for p in LLAMA3_PRE}}
+IGNORE_MERGES = frozenset({"tekken"}) | LLAMA3_PRE
 
 
 class Tokenizer:
@@ -105,6 +122,10 @@ class Tokenizer:
         # the pre-tokenizer of the declared `pre` (the Qwen pattern for any other: the files Strata ran before)
         self._re = regex.compile(PRE_PATTERNS.get(pre, QWEN35_PATTERN))
         self.ignore_merges = pre in IGNORE_MERGES
+        # encode() never prepends BOS: a round trip has to stay the text.  from_gguf / the server set these
+        # when the model asks for it, and the server prepends the id once on the rendered prompt.
+        self.add_bos = False
+        self.bos_id = None
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -155,9 +176,15 @@ class Tokenizer:
             raise ValueError("expected a byte-level BPE tokenizer (model 'gpt2'), got %r" % model)
         special = {k: int(md[k]) for k in md
                    if k.startswith("tokenizer.ggml.") and k.endswith("_token_id")}
-        return cls(list(md["tokenizer.ggml.tokens"]), list(md["tokenizer.ggml.merges"]),
-                   list(md.get("tokenizer.ggml.token_type") or []) or None,
-                   md.get("tokenizer.ggml.pre", "qwen35"), special)
+        pre = md.get("tokenizer.ggml.pre", "qwen35")
+        tk = cls(list(md["tokenizer.ggml.tokens"]), list(md["tokenizer.ggml.merges"]),
+                 list(md.get("tokenizer.ggml.token_type") or []) or None, pre, special)
+        # llama.cpp sets add_bos for pixtral / llama3, then lets tokenizer.ggml.add_bos_token override it.
+        raw_bos = md.get("tokenizer.ggml.add_bos_token")
+        tk.add_bos = (pre in LLAMA3_PRE) if raw_bos is None else bool(raw_bos)
+        bos = md.get("tokenizer.ggml.bos_token_id")
+        tk.bos_id = int(bos) if isinstance(bos, int) and not isinstance(bos, bool) else None
+        return tk
 
     # -------------------------------------------------------------- the algorithm
     def _bpe(self, word: str) -> list[str]:
@@ -334,12 +361,14 @@ def extract(gguf_path, out_dir) -> dict:
         "vocab_size": len(tk.tokens),
         "n_merges": len(tk.ranks),
         "special_ids": tk.special_ids,
-        "add_bos_token": False,
+        "add_bos_token": tk.add_bos,
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
         "pre_pattern": PRE_PATTERNS.get(tk.pre, QWEN35_PATTERN),
-        "pre_pattern_source": ("tokenizer.json (llama.cpp src/llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_TEKKEN)" if tk.pre == "tekken"
-                               else ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
+        "pre_pattern_source": (
+            "tokenizer.json (llama.cpp src/llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_TEKKEN)" if tk.pre == "tekken"
+            else "llama.cpp src/llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_LLAMA3" if tk.pre in LLAMA3_PRE
+            else ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
         "ignore_merges": tk.ignore_merges,
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
