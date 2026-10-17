@@ -3809,9 +3809,14 @@ class Service:
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         if not changed:
-            return self.tok.encode(prompt, parse_special=True)
-        prompt, plain = unmark_think_literals(prompt, self.literals)
-        return self.tok.encode(prompt, parse_special=True, plain=plain)
+            ids = self.tok.encode(prompt, parse_special=True)
+        else:
+            prompt, plain = unmark_think_literals(prompt, self.literals)
+            ids = self.tok.encode(prompt, parse_special=True, plain=plain)
+        bos = getattr(self.tok, "bos_id", None)
+        if getattr(self.tok, "add_bos", False) and isinstance(bos, int) and (not ids or ids[0] != bos):
+            ids = [bos, *ids]
+        return ids
 
     @contextlib.contextmanager
     def _turn(self, cancel=None):
@@ -6724,9 +6729,23 @@ def main() -> int:
         types = json.loads((tpath / "token_type.json").read_text())
         # the pre-tokenizer the extract recorded (tools/strata_tokenizer.py: "qwen35", or "tekken" for Nemotron-H)
         pre = "qwen35"
+        add_bos = None
+        tcfg = {}
         if (tpath / "tokenizer.json").exists():
-            pre = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8")).get("pre") or "qwen35"
+            tcfg = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8"))
+            pre = tcfg.get("pre") or "qwen35"
+            if isinstance(tcfg.get("add_bos_token"), bool):
+                add_bos = tcfg["add_bos_token"]
         tok = ST.Tokenizer(tokens, merges, types, pre)
+        # pixtral / llama3 prepend BOS in llama.cpp unless the extract recorded add_bos_token false.
+        # encode() itself does not: a round trip of a fragment would keep the special token.
+        if add_bos is None:
+            add_bos = pre in ST.LLAMA3_PRE
+        tok.add_bos = bool(add_bos)
+        specials = tcfg.get("special_ids") if isinstance(tcfg.get("special_ids"), dict) else {}
+        bos = specials.get("tokenizer.ggml.bos_token_id")
+        if tok.add_bos and isinstance(bos, int) and not isinstance(bos, bool):
+            tok.bos_id = bos
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:
