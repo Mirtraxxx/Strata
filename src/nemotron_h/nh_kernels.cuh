@@ -211,7 +211,7 @@ __global__ void __launch_bounds__(128) k_conv(float* hist, const float* in, int 
 /// dt_bias), dA = exp(dt * A); s = s * dA + B * (x * dt); y = C . s, then y += D * x.  State [H][P=64][N=128] fp32.
 /// Block = one head, 256 threads: thread (p = tid / 4, q = tid % 4) keeps states n in [32 q, 32 q + 32) in
 /// registers.  xc rows: x [0, H P) | B [H P, H P + G N) | C [.., + G N), `C_` floats apart.  dt rows `ld_dt` apart.
-/// y (T, H P) may be null (a commit).  grid H.
+/// y (T, H P) may be null (a commit).  grid H.  Decode and short chunks; long prompt chunks use nh_ssm_scan.cuh.
 __global__ void __launch_bounds__(256) k_ssm(float* state, const float* xc, int C_, const float* dt, int ld_dt,
                                             const float* dt_bias, const float* A, const float* D, float* y, int H,
                                             int G, int T, bool write) {
