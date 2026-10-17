@@ -372,6 +372,11 @@ int main(int argc, char** argv) {
         // Draft tokens (7)
         std::fwrite(draft_tokens.data(), sizeof(int32_t), draft_tokens.size(), fout);
 
+        // LiLiCorr lattice (block_size rows of n_embd_dec floats), read by nh_dflash_test when present
+        if (lattice) {
+            std::fwrite(lattice, sizeof(float), (size_t) block_size * n_embd_dec, fout);
+        }
+
         std::fclose(fout);
         std::fprintf(stderr, "Wrote dump to %s\n", dump_path.c_str());
     }

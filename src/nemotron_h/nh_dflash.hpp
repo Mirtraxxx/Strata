@@ -78,6 +78,14 @@ public:
     // Drafter GPU execution time of the last draft() call in milliseconds
     float last_draft_ms() const;
 
+    // Retrieve computed lattice [8, 4096] floats
+    void get_lattice(float* h_lattice_out) const;
+    const float* lattice_device() const;
+
+    // Test hook: LiLiCorr reads its candidates from these [7, n_vocab] device logits instead of the drafter's own
+    // (nullptr restores normal drafting). Lets nh_dflash_test feed llama.cpp's logits to check LiLiCorr alone.
+    void set_lilicorr_logits_override(const float* d_logits);
+
     const DFlashConfig& config() const;
 
 private:

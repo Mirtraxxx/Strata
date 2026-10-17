@@ -118,6 +118,29 @@ __global__ void dequantize_nvfp4_kernel(const block_nvfp4* __restrict__ vx, half
     yy[y1] = __float2half(v1);
 }
 
+__global__ void dequantize_nvfp4_f32_kernel(const block_nvfp4* __restrict__ vx, float* __restrict__ yy, int64_t ne, float tensor_scale) {
+    int64_t i = blockIdx.x;
+    int tid = threadIdx.x;
+    int64_t base = i * QK_NVFP4;
+    if (base >= ne) return;
+
+    const block_nvfp4& xb = vx[i];
+    int sub = tid / (QK_NVFP4_SUB / 2);
+    int j = tid % (QK_NVFP4_SUB / 2);
+
+    float d = ue4m3_to_fp32(xb.d[sub]) * tensor_scale;
+    uint8_t q = xb.qs[sub * (QK_NVFP4_SUB / 2) + j];
+
+    int64_t y0 = base + sub * QK_NVFP4_SUB + j;
+    int64_t y1 = y0 + QK_NVFP4_SUB / 2;
+
+    float v0 = d * c_kvalues_fp4[q & 0x0F];
+    float v1 = d * c_kvalues_fp4[q >> 4];
+
+    yy[y0] = v0;
+    yy[y1] = v1;
+}
+
 __global__ void convert_bf16_to_half_kernel(const uint16_t* __restrict__ src, half* __restrict__ dst, int64_t ne) {
     int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < ne) {
@@ -405,6 +428,395 @@ __global__ void draft_argmax_kernel(const float* __restrict__ logits, int n_voca
     }
 }
 
+__global__ void find_top8_and_lse_kernel(const float* __restrict__ logits,
+                                        int n_vocab,
+                                        int32_t* __restrict__ cand_ids,
+                                        float* __restrict__ cand_logits,
+                                        float* __restrict__ lse_out,
+                                        float* __restrict__ probs_out) {
+    int s = blockIdx.x;
+    int tid = threadIdx.x;
+    const float* row = logits + (size_t) s * n_vocab;
+
+    float t_val[8];
+    int32_t t_id[8];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        t_val[k] = -1e30f;
+        t_id[k] = -1;
+    }
+
+    float t_max = -1e30f;
+    float t_sum = 0.0f;
+
+    for (int idx = tid; idx < n_vocab; idx += blockDim.x) {
+        float v = row[idx];
+        if (v > t_max) {
+            t_sum = t_sum * expf(t_max - v) + 1.0f;
+            t_max = v;
+        } else {
+            t_sum += expf(v - t_max);
+        }
+
+        if (v > t_val[7]) {
+            int p = 6;
+            while (p >= 0 && v > t_val[p]) {
+                t_val[p + 1] = t_val[p];
+                t_id[p + 1] = t_id[p];
+                p--;
+            }
+            t_val[p + 1] = v;
+            t_id[p + 1] = idx;
+        }
+    }
+
+    __shared__ float s_val[256 * 8];
+    __shared__ int32_t s_id[256 * 8];
+    __shared__ float s_max[256];
+    __shared__ float s_sum[256];
+
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        s_val[tid * 8 + k] = t_val[k];
+        s_id[tid * 8 + k] = t_id[k];
+    }
+    s_max[tid] = t_max;
+    s_sum[tid] = t_sum;
+    __syncthreads();
+
+    for (int step = 128; step > 0; step >>= 1) {
+        if (tid < step) {
+            float m_val[8];
+            int32_t m_id[8];
+            int p0 = 0, p1 = 0;
+            const float* ptr0 = &s_val[tid * 8];
+            const int32_t* id0 = &s_id[tid * 8];
+            const float* ptr1 = &s_val[(tid + step) * 8];
+            const int32_t* id1 = &s_id[(tid + step) * 8];
+
+            #pragma unroll
+            for (int out = 0; out < 8; ++out) {
+                if (p0 < 8 && (p1 >= 8 || ptr0[p0] >= ptr1[p1])) {
+                    m_val[out] = ptr0[p0];
+                    m_id[out] = id0[p0];
+                    p0++;
+                } else {
+                    m_val[out] = ptr1[p1];
+                    m_id[out] = id1[p1];
+                    p1++;
+                }
+            }
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                s_val[tid * 8 + k] = m_val[k];
+                s_id[tid * 8 + k] = m_id[k];
+            }
+
+            float m0 = s_max[tid], m1 = s_max[tid + step];
+            float sum0 = s_sum[tid], sum1 = s_sum[tid + step];
+            if (m1 > m0) {
+                s_sum[tid] = sum0 * expf(m0 - m1) + sum1;
+                s_max[tid] = m1;
+            } else {
+                s_sum[tid] = sum0 + sum1 * expf(m1 - m0);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float lse = s_max[0] + logf(s_sum[0]);
+        lse_out[s] = lse;
+        for (int k = 0; k < 8; ++k) {
+            cand_ids[s * 8 + k] = s_id[k];
+            cand_logits[s * 8 + k] = s_val[k];
+            probs_out[s * 8 + k] = expf(s_val[k] - lse);
+        }
+    }
+}
+
+__global__ void compute_feature_mlp1_kernel(const float* __restrict__ cand_logits,
+                                           const float* __restrict__ lse,
+                                           const float* __restrict__ probs,
+                                           const float* __restrict__ fnorm_w,
+                                           const float* __restrict__ fnorm_b,
+                                           const float* __restrict__ mlp1_w,
+                                           const float* __restrict__ mlp1_b,
+                                           float* __restrict__ out) {
+    int node = blockIdx.x;
+    int s = node / 8;
+    int k = node % 8;
+
+    float lp = logf(fmaxf(probs[node], 1e-20f));
+    float top_lp = logf(fmaxf(probs[s * 8 + 0], 1e-20f));
+
+    float f[5];
+    f[0] = lp;
+    f[1] = probs[node];
+    f[2] = lp - top_lp;
+    f[3] = (float) k / 7.0f;
+    f[4] = (k == 0) ? 1.0f : 0.0f;
+
+    float m = (f[0] + f[1] + f[2] + f[3] + f[4]) * 0.2f;
+    float var = ((f[0] - m) * (f[0] - m) +
+                 (f[1] - m) * (f[1] - m) +
+                 (f[2] - m) * (f[2] - m) +
+                 (f[3] - m) * (f[3] - m) +
+                 (f[4] - m) * (f[4] - m)) * 0.2f;
+    float inv_std = rsqrtf(var + 1.0e-5f);
+    float fn[5];
+    #pragma unroll
+    for (int c = 0; c < 5; ++c) {
+        fn[c] = (f[c] - m) * inv_std * fnorm_w[c] + fnorm_b[c];
+    }
+
+    for (int h = threadIdx.x; h < 1024; h += blockDim.x) {
+        float sum = mlp1_b[h];
+        #pragma unroll
+        for (int c = 0; c < 5; ++c) {
+            sum += mlp1_w[h * 5 + c] * fn[c];
+        }
+        out[node * 1024 + h] = sum / (1.0f + expf(-sum));
+    }
+}
+
+__global__ void combine_inputs_kernel(const float* __restrict__ token_states,
+                                     const float* __restrict__ pass_proj,
+                                     const float* __restrict__ pass_b,
+                                     const float* __restrict__ feature_states,
+                                     const float* __restrict__ feature_mlp3_b,
+                                     const float* __restrict__ slot_embd,
+                                     const float* __restrict__ rank_embd,
+                                     float* __restrict__ x) {
+    int node = blockIdx.x;
+    int s = node / 8;
+    int k = node % 8;
+
+    for (int h = threadIdx.x; h < 1024; h += blockDim.x) {
+        float tok = token_states[node * 1024 + h];
+        float pass = pass_proj[s * 1024 + h] + pass_b[h];
+        float feat = feature_states[node * 1024 + h] + feature_mlp3_b[h];
+        float pos = slot_embd[s * 1024 + h] + rank_embd[k * 1024 + h];
+        x[node * 1024 + h] = tok + pass + feat + pos;
+    }
+}
+
+__global__ void rms_norm_f32_scaled_kernel(const float* __restrict__ x,
+                                          const float* __restrict__ w,
+                                          float* __restrict__ y,
+                                          int dim,
+                                          int ncols,
+                                          float eps) {
+    int t = blockIdx.x;
+    if (t >= ncols) return;
+    const float* xt = x + t * dim;
+    float* yt = y + t * dim;
+
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = xt[i];
+        sum_sq += v * v;
+    }
+    sum_sq = block_reduce_sum(sum_sq);
+    __shared__ float s_scale;
+    if (threadIdx.x == 0) {
+        s_scale = rsqrtf(sum_sq / (float) dim + eps);
+    }
+    __syncthreads();
+    float scale = s_scale;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        yt[i] = xt[i] * scale * w[i];
+    }
+}
+
+__global__ void add_bias_f32_kernel(float* __restrict__ x, const float* __restrict__ b, int dim, int ncols) {
+    int col = blockIdx.x;
+    if (col >= ncols) return;
+    float* xt = x + col * dim;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        xt[i] += b[i];
+    }
+}
+
+__global__ void lilicorr_attn_kernel(const float* __restrict__ qkv,
+                                    const float* __restrict__ attn_bias,
+                                    float* __restrict__ attn_out) {
+    int h = blockIdx.x;
+    int q = threadIdx.x;
+
+    if (q >= 56) return;
+
+    float my_q[128];
+    const float* q_ptr = qkv + q * 3072 + h * 128;
+    #pragma unroll
+    for (int d = 0; d < 128; ++d) {
+        my_q[d] = q_ptr[d];
+    }
+
+    float scores[56];
+    float max_s = -1e30f;
+    const float scale = 0.08838834764831845f;
+    const float* bias_ptr = attn_bias + h * 56 * 56 + q * 56;
+
+    for (int k = 0; k < 56; ++k) {
+        const float* k_ptr = qkv + k * 3072 + 1024 + h * 128;
+        float dot = 0.0f;
+        #pragma unroll
+        for (int d = 0; d < 128; ++d) {
+            dot += my_q[d] * k_ptr[d];
+        }
+        float s = dot * scale + bias_ptr[k];
+        scores[k] = s;
+        if (s > max_s) max_s = s;
+    }
+
+    float sum_exp = 0.0f;
+    for (int k = 0; k < 56; ++k) {
+        float ex = expf(scores[k] - max_s);
+        scores[k] = ex;
+        sum_exp += ex;
+    }
+    float inv_sum = 1.0f / sum_exp;
+    for (int k = 0; k < 56; ++k) {
+        scores[k] *= inv_sum;
+    }
+
+    float* out_ptr = attn_out + q * 1024 + h * 128;
+    for (int d = 0; d < 128; ++d) {
+        float val = 0.0f;
+        for (int k = 0; k < 56; ++k) {
+            val += scores[k] * qkv[k * 3072 + 2048 + h * 128 + d];
+        }
+        out_ptr[d] = val;
+    }
+}
+
+__global__ void add_bias_and_residual_kernel(const float* __restrict__ proj,
+                                            const float* __restrict__ bias,
+                                            float* __restrict__ x,
+                                            int dim,
+                                            int ncols) {
+    int col = blockIdx.x;
+    if (col >= ncols) return;
+    const float* p = proj + col * dim;
+    float* xt = x + col * dim;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        xt[i] += p[i] + bias[i];
+    }
+}
+
+
+__global__ void build_factor_in_kernel(const float* __restrict__ x_norm,
+                                      const float* __restrict__ anchor_norm,
+                                      float* __restrict__ factor_in,
+                                      int dim,
+                                      int ncols) {
+    int col = blockIdx.x;
+    if (col >= ncols) return;
+    const float* xn = x_norm + col * dim;
+    float* fi = factor_in + col * (3 * dim);
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float x_val = xn[d];
+        float a_val = anchor_norm[d];
+        fi[d] = x_val;
+        fi[dim + d] = a_val;
+        fi[2 * dim + d] = x_val * a_val;
+    }
+}
+
+__global__ void silu_f32_in_place_kernel(float* __restrict__ x, const float* __restrict__ bias, int dim, int ncols) {
+    int col = blockIdx.x;
+    if (col >= ncols) return;
+    float* xt = x + col * dim;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float v = xt[d] + bias[d];
+        xt[d] = v / (1.0f + expf(-v));
+    }
+}
+
+__global__ void add_bias_and_l2_norm_kernel(float* __restrict__ x,
+                                           const float* __restrict__ bias,
+                                           int dim,
+                                           int ncols,
+                                           float eps) {
+    int col = blockIdx.x;
+    if (col >= ncols) return;
+    float* xt = x + col * dim;
+    float sum_sq = 0.0f;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float v = xt[d] + bias[d];
+        xt[d] = v;
+        sum_sq += v * v;
+    }
+    sum_sq = block_reduce_sum(sum_sq);
+    __shared__ float s_scale;
+    if (threadIdx.x == 0) {
+        s_scale = rsqrtf(fmaxf(sum_sq, eps * eps));
+    }
+    __syncthreads();
+    float scale = s_scale;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        xt[d] *= scale;
+    }
+}
+
+__global__ void build_lilicorr_lattice_kernel(const int32_t* __restrict__ cand_ids,
+                                             const float* __restrict__ anchor_out,
+                                             const float* __restrict__ in_vecs,
+                                             const float* __restrict__ out_vecs,
+                                             float* __restrict__ lattice,
+                                             float logit_scale) {
+    int pos = blockIdx.x;
+    float* row = lattice + (size_t) pos * 4096;
+
+    for (int i = threadIdx.x; i < 4096; i += blockDim.x) {
+        row[i] = 0.0f;
+    }
+    __syncthreads();
+
+    if (pos == 0) return;
+
+    int s = pos - 1;
+
+    if (threadIdx.x < 8) {
+        row[threadIdx.x] = (float) cand_ids[s * 8 + threadIdx.x];
+    }
+    __syncthreads();
+
+    if (pos == 1) {
+        for (int k = 0; k < 8; ++k) {
+            const float* in_col = in_vecs + k * 1024;
+            float dot = 0.0f;
+            for (int d = threadIdx.x; d < 1024; d += blockDim.x) {
+                dot += anchor_out[d] * in_col[d];
+            }
+            dot = block_reduce_sum(dot);
+            if (threadIdx.x == 0) {
+                row[8 + k] = dot * logit_scale;
+            }
+            __syncthreads();
+        }
+    } else {
+        const float* prev_out = out_vecs + (s - 1) * 8 * 1024;
+        const float* cur_in = in_vecs + s * 8 * 1024;
+        for (int pair = 0; pair < 64; ++pair) {
+            int j = pair / 8;
+            int k = pair % 8;
+            const float* out_col = prev_out + j * 1024;
+            const float* in_col = cur_in + k * 1024;
+            float dot = 0.0f;
+            for (int d = threadIdx.x; d < 1024; d += blockDim.x) {
+                dot += out_col[d] * in_col[d];
+            }
+            dot = block_reduce_sum(dot);
+            if (threadIdx.x == 0) {
+                row[8 + j * 8 + k] = dot * logit_scale;
+            }
+            __syncthreads();
+        }
+    }
+}
+
 // Simple flexible attention kernel for decode/draft where n_block=8 and total_keys <= 1024
 __global__ void dflash_attn_block_kernel(const half* __restrict__ q, const half* __restrict__ k_block, const half* __restrict__ v_block,
                                         const half* __restrict__ k_cache, const half* __restrict__ v_cache, const float* __restrict__ sinks,
@@ -578,9 +990,9 @@ struct DFlashDrafter::Impl {
     void* d_owned_output = nullptr;
 
     // LiLiCorr weights
-    half* d_lilicorr_token_proj = nullptr; // [4096, 1024]
+    float* d_lilicorr_token_proj = nullptr; // [4096, 1024]
     float* d_lilicorr_token_proj_b = nullptr; // [1024]
-    half* d_lilicorr_pass_hidden_proj = nullptr; // [4096, 1024]
+    float* d_lilicorr_pass_hidden_proj = nullptr; // [4096, 1024]
     float* d_lilicorr_pass_hidden_proj_b = nullptr; // [1024]
     float* d_lilicorr_feature_norm = nullptr; // [5]
     float* d_lilicorr_feature_norm_b = nullptr; // [5]
@@ -591,7 +1003,7 @@ struct DFlashDrafter::Impl {
     float* d_lilicorr_slot_embedding = nullptr; // [1024, 7]
     float* d_lilicorr_rank_embedding = nullptr; // [1024, 8]
     float* d_lilicorr_attention_bias = nullptr; // [56, 56, 8]
-    half* d_lilicorr_context_proj = nullptr; // [4096, 1024]
+    float* d_lilicorr_context_proj = nullptr; // [4096, 1024]
     float* d_lilicorr_context_proj_b = nullptr; // [1024]
 
     struct LiLiCorrLayerWeights {
@@ -599,11 +1011,11 @@ struct DFlashDrafter::Impl {
         float* mlp_norm = nullptr; // [1024]
         float* attn_in_proj = nullptr; // [1024, 3072]
         float* attn_in_proj_b = nullptr; // [3072]
-        half* attn_out_proj = nullptr; // [1024, 1024]
+        float* attn_out_proj = nullptr; // [1024, 1024]
         float* attn_out_proj_b = nullptr; // [1024]
-        half* mlp_0 = nullptr; // [1024, 2048]
+        float* mlp_0 = nullptr; // [1024, 2048]
         float* mlp_0_b = nullptr; // [2048]
-        half* mlp_2 = nullptr; // [2048, 1024]
+        float* mlp_2 = nullptr; // [2048, 1024]
         float* mlp_2_b = nullptr; // [1024]
     };
     std::vector<LiLiCorrLayerWeights> lilicorr_layers;
@@ -617,6 +1029,35 @@ struct DFlashDrafter::Impl {
     float* d_lilicorr_in_head_b = nullptr; // [1024]
     float* d_lilicorr_anchor_out_head = nullptr; // [1024, 1024]
     float* d_lilicorr_anchor_out_head_b = nullptr; // [1024]
+
+    // LiLiCorr runtime activation and lattice buffers
+    int32_t* d_lilicorr_cand_ids = nullptr;
+    float* d_lilicorr_cand_logits = nullptr;
+    float* d_lilicorr_lse = nullptr;
+    float* d_lilicorr_probs = nullptr;
+    float* d_lilicorr_feat_mlp1_out = nullptr;
+    float* d_lilicorr_feature_states = nullptr;
+    float* d_lilicorr_embeds_f32 = nullptr;
+    float* d_lilicorr_token_states = nullptr;
+    float* d_lilicorr_pass_proj = nullptr;
+    float* d_lilicorr_anchor_state_proj = nullptr;
+    float* d_lilicorr_x = nullptr;
+    float* d_lilicorr_norm_x = nullptr;
+    float* d_lilicorr_qkv = nullptr;
+    float* d_lilicorr_attn_out = nullptr;
+    float* d_lilicorr_attn_proj = nullptr;
+    float* d_lilicorr_ffn_norm_f32 = nullptr;
+    float* d_lilicorr_mlp_gate = nullptr;
+    float* d_lilicorr_mlp_out = nullptr;
+    float* d_lilicorr_norm_anchor = nullptr;
+    float* d_lilicorr_factor_in = nullptr;
+    float* d_lilicorr_factors = nullptr;
+    float* d_lilicorr_out = nullptr;
+    float* d_lilicorr_in = nullptr;
+    float* d_lilicorr_anchor_out = nullptr;
+    float* d_lilicorr_lattice = nullptr;
+    std::vector<float> h_lattice;
+    const float* d_lilicorr_logits_override = nullptr;
 
     // KV cache per layer: [sliding_window=1024, n_head_kv=2, head_dim=128]
     struct LayerKVCache {
@@ -636,7 +1077,7 @@ struct DFlashDrafter::Impl {
 
     half* d_enc_inp_half = nullptr;
     size_t enc_inp_half_cap = 0;
-    half* d_enc_fc_out = nullptr;
+    float* d_enc_fc_out = nullptr;
     half* d_enc_norm_out = nullptr;
     size_t enc_fc_out_cap = 0;
     cudaStream_t default_stream = nullptr;
@@ -713,6 +1154,31 @@ struct DFlashDrafter::Impl {
         free_buf((void*&) d_lilicorr_in_head_b);
         free_buf((void*&) d_lilicorr_anchor_out_head);
         free_buf((void*&) d_lilicorr_anchor_out_head_b);
+        free_buf((void*&) d_lilicorr_cand_ids);
+        free_buf((void*&) d_lilicorr_cand_logits);
+        free_buf((void*&) d_lilicorr_lse);
+        free_buf((void*&) d_lilicorr_probs);
+        free_buf((void*&) d_lilicorr_feat_mlp1_out);
+        free_buf((void*&) d_lilicorr_feature_states);
+        free_buf((void*&) d_lilicorr_embeds_f32);
+        free_buf((void*&) d_lilicorr_token_states);
+        free_buf((void*&) d_lilicorr_pass_proj);
+        free_buf((void*&) d_lilicorr_anchor_state_proj);
+        free_buf((void*&) d_lilicorr_x);
+        free_buf((void*&) d_lilicorr_norm_x);
+        free_buf((void*&) d_lilicorr_qkv);
+        free_buf((void*&) d_lilicorr_attn_out);
+        free_buf((void*&) d_lilicorr_attn_proj);
+        free_buf((void*&) d_lilicorr_ffn_norm_f32);
+        free_buf((void*&) d_lilicorr_mlp_gate);
+        free_buf((void*&) d_lilicorr_mlp_out);
+        free_buf((void*&) d_lilicorr_norm_anchor);
+        free_buf((void*&) d_lilicorr_factor_in);
+        free_buf((void*&) d_lilicorr_factors);
+        free_buf((void*&) d_lilicorr_out);
+        free_buf((void*&) d_lilicorr_in);
+        free_buf((void*&) d_lilicorr_anchor_out);
+        free_buf((void*&) d_lilicorr_lattice);
         for (auto& c : kv_caches) {
             free_buf((void*&) c.k_cache);
             free_buf((void*&) c.v_cache);
@@ -738,6 +1204,20 @@ const DFlashConfig& DFlashDrafter::config() const {
 
 float DFlashDrafter::last_draft_ms() const {
     return impl_->last_ms;
+}
+
+void DFlashDrafter::get_lattice(float* h_lattice_out) const {
+    if (h_lattice_out && !impl_->h_lattice.empty()) {
+        std::memcpy(h_lattice_out, impl_->h_lattice.data(), impl_->h_lattice.size() * sizeof(float));
+    }
+}
+
+void DFlashDrafter::set_lilicorr_logits_override(const float* d_logits) {
+    impl_->d_lilicorr_logits_override = d_logits;
+}
+
+const float* DFlashDrafter::lattice_device() const {
+    return impl_->d_lilicorr_lattice;
 }
 
 void DFlashDrafter::set_target_weights(const void* d_token_embd_q8, const void* d_output_q8, int vocab_size) {
@@ -789,6 +1269,31 @@ bool DFlashDrafter::load(const std::string& dflash_gguf_path,
             CUDA_CHECK(cudaMemcpy(d_raw, raw_data, raw_bytes, cudaMemcpyHostToDevice));
             int nb = (int) (n_elems / QK_NVFP4);
             dequantize_nvfp4_kernel<<<nb, 32>>>(reinterpret_cast<const block_nvfp4*>(d_raw), d_ptr, n_elems, scale_val);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaFree(d_raw));
+        };
+
+        auto load_nvfp4_f32 = [&](const std::string& name, const std::string& scale_name, float*& d_ptr, int64_t n_elems) {
+            size_t s = 0;
+            const strata::TensorInfo* t = gm_dft.find(name, &s);
+            if (!t) throw std::runtime_error("missing tensor: " + name);
+            float scale_val = 1.0f;
+            if (!scale_name.empty()) {
+                size_t ss = 0;
+                const strata::TensorInfo* ts = gm_dft.find(scale_name, &ss);
+                if (ts) {
+                    const void* s_raw = gm_dft.shard(ss).tensor_data(*ts);
+                    std::memcpy(&scale_val, s_raw, sizeof(float));
+                }
+            }
+            CUDA_CHECK(cudaMalloc(&d_ptr, n_elems * sizeof(float)));
+            const void* raw_data = gm_dft.shard(s).tensor_data(*t);
+            void* d_raw = nullptr;
+            size_t raw_bytes = (size_t) (n_elems / QK_NVFP4) * sizeof(block_nvfp4);
+            CUDA_CHECK(cudaMalloc(&d_raw, raw_bytes));
+            CUDA_CHECK(cudaMemcpy(d_raw, raw_data, raw_bytes, cudaMemcpyHostToDevice));
+            int nb = (int) (n_elems / QK_NVFP4);
+            dequantize_nvfp4_f32_kernel<<<nb, 32>>>(reinterpret_cast<const block_nvfp4*>(d_raw), d_ptr, n_elems, scale_val);
             CUDA_CHECK(cudaDeviceSynchronize());
             CUDA_CHECK(cudaFree(d_raw));
         };
@@ -848,9 +1353,9 @@ bool DFlashDrafter::load(const std::string& dflash_gguf_path,
         load_f32("output_norm.weight", impl_->d_output_norm, impl_->cfg.n_embd);
 
         // 3. LiLiCorr Tensors
-        load_nvfp4("lilicorr.token_proj.weight", "lilicorr.token_proj.scale", impl_->d_lilicorr_token_proj, (int64_t) impl_->cfg.n_embd * impl_->cfg.lilicorr_hidden);
+        load_nvfp4_f32("lilicorr.token_proj.weight", "lilicorr.token_proj.scale", impl_->d_lilicorr_token_proj, (int64_t) impl_->cfg.n_embd * impl_->cfg.lilicorr_hidden);
         load_f32("lilicorr.token_proj.bias", impl_->d_lilicorr_token_proj_b, impl_->cfg.lilicorr_hidden);
-        load_nvfp4("lilicorr.pass_hidden_proj.weight", "lilicorr.pass_hidden_proj.scale", impl_->d_lilicorr_pass_hidden_proj, (int64_t) impl_->cfg.n_embd * impl_->cfg.lilicorr_hidden);
+        load_nvfp4_f32("lilicorr.pass_hidden_proj.weight", "lilicorr.pass_hidden_proj.scale", impl_->d_lilicorr_pass_hidden_proj, (int64_t) impl_->cfg.n_embd * impl_->cfg.lilicorr_hidden);
         load_f32("lilicorr.pass_hidden_proj.bias", impl_->d_lilicorr_pass_hidden_proj_b, impl_->cfg.lilicorr_hidden);
         load_f32("blk.7.ffn_norm.weight", impl_->d_lilicorr_feature_norm, 5);
         load_f32("blk.7.ffn_norm.bias", impl_->d_lilicorr_feature_norm_b, 5);
@@ -861,7 +1366,7 @@ bool DFlashDrafter::load(const std::string& dflash_gguf_path,
         load_f32("lilicorr.slot_embedding.weight", impl_->d_lilicorr_slot_embedding, impl_->cfg.lilicorr_hidden * (impl_->cfg.block_size - 1));
         load_f32("lilicorr.rank_embedding.weight", impl_->d_lilicorr_rank_embedding, impl_->cfg.lilicorr_hidden * impl_->cfg.lilicorr_top_k);
         load_f32("lilicorr.attention_bias.bias", impl_->d_lilicorr_attention_bias, 56 * 56 * impl_->cfg.lilicorr_heads);
-        load_nvfp4("lilicorr.context_proj.weight", "lilicorr.context_proj.scale", impl_->d_lilicorr_context_proj, (int64_t) impl_->cfg.n_embd * impl_->cfg.lilicorr_hidden);
+        load_nvfp4_f32("lilicorr.context_proj.weight", "lilicorr.context_proj.scale", impl_->d_lilicorr_context_proj, (int64_t) impl_->cfg.n_embd * impl_->cfg.lilicorr_hidden);
         load_f32("lilicorr.context_proj.bias", impl_->d_lilicorr_context_proj_b, impl_->cfg.lilicorr_hidden);
 
         // LiLiCorr layers 0, 1 (blk.5, blk.6)
@@ -874,11 +1379,11 @@ bool DFlashDrafter::load(const std::string& dflash_gguf_path,
             load_f32(bp + "ffn_norm.weight", l.mlp_norm, impl_->cfg.lilicorr_hidden);
             load_f32(lp + "attn.in_proj.weight", l.attn_in_proj, impl_->cfg.lilicorr_hidden * 3 * impl_->cfg.lilicorr_hidden);
             load_f32(lp + "attn.in_proj.bias", l.attn_in_proj_b, 3 * impl_->cfg.lilicorr_hidden);
-            load_nvfp4(bp + "attn_output.weight", bp + "attn_output.scale", l.attn_out_proj, impl_->cfg.lilicorr_hidden * impl_->cfg.lilicorr_hidden);
+            load_nvfp4_f32(bp + "attn_output.weight", bp + "attn_output.scale", l.attn_out_proj, impl_->cfg.lilicorr_hidden * impl_->cfg.lilicorr_hidden);
             load_f32(bp + "attn_output.bias", l.attn_out_proj_b, impl_->cfg.lilicorr_hidden);
-            load_nvfp4(bp + "ffn_up.weight", bp + "ffn_up.scale", l.mlp_0, impl_->cfg.lilicorr_hidden * impl_->cfg.lilicorr_mlp);
+            load_nvfp4_f32(bp + "ffn_up.weight", bp + "ffn_up.scale", l.mlp_0, impl_->cfg.lilicorr_hidden * impl_->cfg.lilicorr_mlp);
             load_f32(bp + "ffn_up.bias", l.mlp_0_b, impl_->cfg.lilicorr_mlp);
-            load_nvfp4(bp + "ffn_down.weight", bp + "ffn_down.scale", l.mlp_2, impl_->cfg.lilicorr_mlp * impl_->cfg.lilicorr_hidden);
+            load_nvfp4_f32(bp + "ffn_down.weight", bp + "ffn_down.scale", l.mlp_2, impl_->cfg.lilicorr_mlp * impl_->cfg.lilicorr_hidden);
             load_f32(bp + "ffn_down.bias", l.mlp_2_b, impl_->cfg.lilicorr_hidden);
         }
         load_f32("lilicorr.output_norm.weight", impl_->d_lilicorr_output_norm, impl_->cfg.lilicorr_hidden);
@@ -939,6 +1444,34 @@ bool DFlashDrafter::load(const std::string& dflash_gguf_path,
         size_t q8_bytes = strata::kernels::native_q8_1_bytes(impl_->cfg.n_embd, impl_->cfg.block_size);
         CUDA_CHECK(cudaMalloc(&impl_->d_q8_scratch, q8_bytes));
 
+        // 7. LiLiCorr runtime buffers
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_cand_ids, 56 * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_cand_logits, 56 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_lse, 7 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_probs, 56 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_feat_mlp1_out, 56 * 1024 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_feature_states, 56 * 1024 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_embeds_f32, 56 * impl_->cfg.n_embd * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_token_states, 56 * 1024 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_pass_proj, 7 * 1024 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_anchor_state_proj, 1024 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_x, 56 * 1024 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_norm_x, 56 * 1024 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_qkv, 56 * 3072 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_attn_out, 56 * 1024 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_attn_proj, 56 * 1024 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_ffn_norm_f32, 56 * 1024 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_mlp_gate, 56 * 2048 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_mlp_out, 56 * 1024 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_norm_anchor, 1024 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_factor_in, 56 * 3072 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_factors, 56 * 1024 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_out, 56 * 1024 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_in, 56 * 1024 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_anchor_out, 1024 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&impl_->d_lilicorr_lattice, 8 * 4096 * sizeof(float)));
+        impl_->h_lattice.resize(8 * 4096, 0.0f);
+
         return true;
     } catch (const std::exception& e) {
         err = e.what();
@@ -964,7 +1497,7 @@ void DFlashDrafter::encode_and_inject(const float* d_target_features,
     if (needed_fc > m.enc_fc_out_cap) {
         if (m.d_enc_fc_out) cudaFree(m.d_enc_fc_out);
         if (m.d_enc_norm_out) cudaFree(m.d_enc_norm_out);
-        CUDA_CHECK(cudaMalloc(&m.d_enc_fc_out, needed_fc * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&m.d_enc_fc_out, needed_fc * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&m.d_enc_norm_out, needed_fc * sizeof(half)));
         m.enc_fc_out_cap = needed_fc;
     }
@@ -975,25 +1508,25 @@ void DFlashDrafter::encode_and_inject(const float* d_target_features,
     int g = (int) ((needed_inp + b - 1) / b);
     convert_f32_to_half_kernel<<<g, b, 0, stream>>>(d_target_features, d_inp_half, needed_inp);
 
-    // 2. Encoder projection: fc(inp_target) -> [4096, n_tokens]
-    half* d_fc_out = m.d_enc_fc_out;
+    // 2. Encoder projection: fc(inp_target) -> [4096, n_tokens] (FP32)
+    float* d_fc_out = m.d_enc_fc_out;
     float alpha = 1.0f, beta = 0.0f;
     CUBLAS_CHECK(cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                              m.cfg.n_embd, n_tokens, m.cfg.n_embd_inp,
                              &alpha, m.d_fc_weight, CUDA_R_16F, m.cfg.n_embd_inp,
                              d_inp_half, CUDA_R_16F, m.cfg.n_embd_inp,
-                             &beta, d_fc_out, CUDA_R_16F, m.cfg.n_embd,
+                             &beta, d_fc_out, CUDA_R_32F, m.cfg.n_embd,
                              CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-    check_nan("enc: d_fc_out", d_fc_out, (size_t) m.cfg.n_embd * n_tokens, stream);
+    check_nan_f32("enc: d_fc_out", d_fc_out, (size_t) m.cfg.n_embd * n_tokens, stream);
 
     // 3. Encoder norm: rms_norm(fc_out, enc_output_norm)
     half* d_inp_g = m.d_enc_norm_out;
-    rms_norm_kernel<<<n_tokens, 256, 0, stream>>>(d_fc_out, m.d_enc_output_norm, d_inp_g, m.cfg.n_embd, n_tokens, m.cfg.eps);
+    rms_norm_f32_to_half_kernel<<<n_tokens, 256, 0, stream>>>(d_fc_out, m.d_enc_output_norm, d_inp_g, m.cfg.n_embd, n_tokens, m.cfg.eps);
     check_nan("enc: d_inp_g", d_inp_g, (size_t) m.cfg.n_embd * n_tokens, stream);
 
-    // Save the last token's context embedding for LiLiCorr anchor
+    // Save the last token's context embedding for LiLiCorr anchor in FP32
     int last_idx = n_tokens - 1;
-    convert_half_to_f32_kernel<<<16, 256, 0, stream>>>(d_inp_g + last_idx * m.cfg.n_embd, m.d_anchor_state, m.cfg.n_embd);
+    rms_norm_f32_to_f32_kernel<<<1, 256, 0, stream>>>(d_fc_out + last_idx * m.cfg.n_embd, m.d_enc_output_norm, m.d_anchor_state, m.cfg.n_embd, 1, m.cfg.eps);
     check_nan_f32("enc: d_anchor_state", m.d_anchor_state, m.cfg.n_embd, stream);
 
     // 4. Inject K and V into KV cache for layers 0..4
@@ -1249,10 +1782,6 @@ std::vector<int32_t> DFlashDrafter::draft(int32_t id_last,
         d_x, m.d_output_norm, d_t_embd_f32, m.cfg.n_embd, block_size, m.cfg.eps);
     check_nan_f32("draft: d_t_embd_f32", d_t_embd_f32, (size_t) m.cfg.n_embd * block_size, stream);
 
-    // Convert d_t_embd_f32 to half for LiLiCorr pass states
-    convert_f32_to_half_kernel<<<(m.cfg.n_embd * block_size + 255) / 256, 256, 0, stream>>>(
-        d_t_embd_f32, d_t_embd, m.cfg.n_embd * block_size);
-
     // 3. LM Head for draft positions 1..7 (7 tokens)
     float* d_logits_7 = d_logits_out ? d_logits_out : (m.d_work_float_1 + 262144);
     // Quantize 7 columns of activations to Q8_1
@@ -1261,12 +1790,193 @@ std::vector<int32_t> DFlashDrafter::draft(int32_t id_last,
     strata::kernels::native_mmvq(8, m.d_output_q8, m.d_q8_scratch, d_logits_7, m.cfg.n_embd, m.cfg.n_vocab, n_draft, stream);
     check_nan_f32("draft: d_logits_7", d_logits_7, (size_t) n_draft * m.cfg.n_vocab, stream);
 
-    int32_t* d_out_tokens = reinterpret_cast<int32_t*>(m.d_work_half_1 + 100000);
-    draft_argmax_kernel<<<n_draft, 256, 0, stream>>>(d_logits_7, m.cfg.n_vocab, n_draft, d_out_tokens);
+    // 4. LiLiCorr Candidate Selection and Feature Computation
+    find_top8_and_lse_kernel<<<7, 256, 0, stream>>>(
+        m.d_lilicorr_logits_override ? m.d_lilicorr_logits_override : d_logits_7, m.cfg.n_vocab, m.d_lilicorr_cand_ids, m.d_lilicorr_cand_logits, m.d_lilicorr_lse, m.d_lilicorr_probs);
+
+    // Feature MLP 1 + SiLU
+    compute_feature_mlp1_kernel<<<56, 256, 0, stream>>>(
+        m.d_lilicorr_cand_logits, m.d_lilicorr_lse, m.d_lilicorr_probs,
+        m.d_lilicorr_feature_norm, m.d_lilicorr_feature_norm_b,
+        m.d_lilicorr_feature_mlp_1, m.d_lilicorr_feature_mlp_1_b,
+        m.d_lilicorr_feat_mlp1_out);
+
+    // Feature MLP 3: GEMM [1024, 1024] x [1024, 56] -> [1024, 56]
+    CUBLAS_CHECK(cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                             1024, 56, 1024,
+                             &alpha, m.d_lilicorr_feature_mlp_3, CUDA_R_32F, 1024,
+                             m.d_lilicorr_feat_mlp1_out, CUDA_R_32F, 1024,
+                             &beta, m.d_lilicorr_feature_states, CUDA_R_32F, 1024,
+                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+
+    // Token Projections:
+    // Dequantize 56 candidate token embeddings from target Q8_0 token_embd into F32
+    dequantize_q8_0_embed_kernel<<<dim3(m.cfg.n_embd / 32, 56), 32, 0, stream>>>(
+        reinterpret_cast<const uint8_t*>(m.d_token_embd_q8), m.d_lilicorr_cand_ids, 56, m.cfg.n_embd, m.d_lilicorr_embeds_f32);
+
+    // Token projection GEMM: [1024, 4096] x [4096, 56] -> [1024, 56]
+    CUBLAS_CHECK(cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                             1024, 56, m.cfg.n_embd,
+                             &alpha, m.d_lilicorr_token_proj, CUDA_R_32F, m.cfg.n_embd,
+                             m.d_lilicorr_embeds_f32, CUDA_R_32F, m.cfg.n_embd,
+                             &beta, m.d_lilicorr_token_states, CUDA_R_32F, 1024,
+                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    add_bias_f32_kernel<<<56, 256, 0, stream>>>(m.d_lilicorr_token_states, m.d_lilicorr_token_proj_b, 1024, 56);
+
+    // Pass hidden projections: GEMM on d_t_embd_f32 slice for positions 1..7: [1024, 4096] x [4096, 7] -> [1024, 7]
+    CUBLAS_CHECK(cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                             1024, 7, m.cfg.n_embd,
+                             &alpha, m.d_lilicorr_pass_hidden_proj, CUDA_R_32F, m.cfg.n_embd,
+                             d_t_embd_f32 + m.cfg.n_embd, CUDA_R_32F, m.cfg.n_embd,
+                             &beta, m.d_lilicorr_pass_proj, CUDA_R_32F, 1024,
+                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+
+    // Combine inputs into x: token_states + (pass_proj + pass_b) + (feature_states + feature_mlp3_b) + (slot_embd + rank_embd)
+    combine_inputs_kernel<<<56, 256, 0, stream>>>(
+        m.d_lilicorr_token_states, m.d_lilicorr_pass_proj, m.d_lilicorr_pass_hidden_proj_b,
+        m.d_lilicorr_feature_states, m.d_lilicorr_feature_mlp_3_b,
+        m.d_lilicorr_slot_embedding, m.d_lilicorr_rank_embedding,
+        m.d_lilicorr_x);
+
+    // Context projection on anchor context features: [1024, 4096] x [4096, 1] -> [1024, 1]
+    CUBLAS_CHECK(cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                             1024, 1, m.cfg.n_embd,
+                             &alpha, m.d_lilicorr_context_proj, CUDA_R_32F, m.cfg.n_embd,
+                             m.d_anchor_state, CUDA_R_32F, m.cfg.n_embd,
+                             &beta, m.d_lilicorr_anchor_state_proj, CUDA_R_32F, 1024,
+                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    add_bias_f32_kernel<<<1, 256, 0, stream>>>(m.d_lilicorr_anchor_state_proj, m.d_lilicorr_context_proj_b, 1024, 1);
+
+    // 5. LiLiCorr Transformer Layers (2 layers)
+    for (int il = 0; il < m.cfg.lilicorr_layers; ++il) {
+        auto& lw = m.lilicorr_layers[il];
+
+        // RMS norm
+        rms_norm_f32_scaled_kernel<<<56, 256, 0, stream>>>(
+            m.d_lilicorr_x, lw.attn_norm, m.d_lilicorr_norm_x, 1024, 56, m.cfg.eps);
+
+        // Attn in proj: [3072, 1024] x [1024, 56] -> [3072, 56]
+        CUBLAS_CHECK(cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                 3072, 56, 1024,
+                                 &alpha, lw.attn_in_proj, CUDA_R_32F, 1024,
+                                 m.d_lilicorr_norm_x, CUDA_R_32F, 1024,
+                                 &beta, m.d_lilicorr_qkv, CUDA_R_32F, 3072,
+                                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        add_bias_f32_kernel<<<56, 256, 0, stream>>>(m.d_lilicorr_qkv, lw.attn_in_proj_b, 3072, 56);
+
+        // Attention over 56 nodes across 8 heads with bias
+        lilicorr_attn_kernel<<<8, 56, 0, stream>>>(
+            m.d_lilicorr_qkv, m.d_lilicorr_attention_bias, m.d_lilicorr_attn_out);
+
+        // Attn out proj: [1024, 1024] x [1024, 56] -> [1024, 56]
+        CUBLAS_CHECK(cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                 1024, 56, 1024,
+                                 &alpha, lw.attn_out_proj, CUDA_R_32F, 1024,
+                                 m.d_lilicorr_attn_out, CUDA_R_32F, 1024,
+                                 &beta, m.d_lilicorr_attn_proj, CUDA_R_32F, 1024,
+                                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        add_bias_and_residual_kernel<<<56, 256, 0, stream>>>(
+            m.d_lilicorr_attn_proj, lw.attn_out_proj_b, m.d_lilicorr_x, 1024, 56);
+
+        // MLP RMS norm
+        rms_norm_f32_scaled_kernel<<<56, 256, 0, stream>>>(
+            m.d_lilicorr_x, lw.mlp_norm, m.d_lilicorr_ffn_norm_f32, 1024, 56, m.cfg.eps);
+
+        // MLP 0: [2048, 1024] x [1024, 56] -> [2048, 56]
+        CUBLAS_CHECK(cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                 2048, 56, 1024,
+                                 &alpha, lw.mlp_0, CUDA_R_32F, 1024,
+                                 m.d_lilicorr_ffn_norm_f32, CUDA_R_32F, 1024,
+                                 &beta, m.d_lilicorr_mlp_gate, CUDA_R_32F, 2048,
+                                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        silu_f32_in_place_kernel<<<56, 256, 0, stream>>>(
+            m.d_lilicorr_mlp_gate, lw.mlp_0_b, 2048, 56);
+
+        // MLP 2: [1024, 2048] x [2048, 56] -> [1024, 56]
+        CUBLAS_CHECK(cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                 1024, 56, 2048,
+                                 &alpha, lw.mlp_2, CUDA_R_32F, 2048,
+                                 m.d_lilicorr_mlp_gate, CUDA_R_32F, 2048,
+                                 &beta, m.d_lilicorr_mlp_out, CUDA_R_32F, 1024,
+                                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        add_bias_and_residual_kernel<<<56, 256, 0, stream>>>(
+            m.d_lilicorr_mlp_out, lw.mlp_2_b, m.d_lilicorr_x, 1024, 56);
+    }
+
+    // 6. Output Norms and Factor Heads
+    rms_norm_f32_scaled_kernel<<<56, 256, 0, stream>>>(
+        m.d_lilicorr_x, m.d_lilicorr_output_norm, m.d_lilicorr_norm_x, 1024, 56, m.cfg.eps);
+    rms_norm_f32_scaled_kernel<<<1, 256, 0, stream>>>(
+        m.d_lilicorr_anchor_state_proj, m.d_lilicorr_anchor_norm, m.d_lilicorr_norm_anchor, 1024, 1, m.cfg.eps);
+
+    build_factor_in_kernel<<<56, 256, 0, stream>>>(
+        m.d_lilicorr_norm_x, m.d_lilicorr_norm_anchor, m.d_lilicorr_factor_in, 1024, 56);
+
+    // Factor input proj: [1024, 3072] x [3072, 56] -> [1024, 56]
+    CUBLAS_CHECK(cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                             1024, 56, 3072,
+                             &alpha, m.d_lilicorr_factor_input_proj, CUDA_R_32F, 3072,
+                             m.d_lilicorr_factor_in, CUDA_R_32F, 3072,
+                             &beta, m.d_lilicorr_factors, CUDA_R_32F, 1024,
+                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    silu_f32_in_place_kernel<<<56, 256, 0, stream>>>(
+        m.d_lilicorr_factors, m.d_lilicorr_factor_input_proj_b, 1024, 56);
+
+    // Out head: [1024, 1024] x [1024, 56] -> [1024, 56]
+    CUBLAS_CHECK(cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                             1024, 56, 1024,
+                             &alpha, m.d_lilicorr_out_head, CUDA_R_32F, 1024,
+                             m.d_lilicorr_factors, CUDA_R_32F, 1024,
+                             &beta, m.d_lilicorr_out, CUDA_R_32F, 1024,
+                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    add_bias_and_l2_norm_kernel<<<56, 256, 0, stream>>>(
+        m.d_lilicorr_out, m.d_lilicorr_out_head_b, 1024, 56, 1e-4f);
+
+    // In head: [1024, 1024] x [1024, 56] -> [1024, 56]
+    CUBLAS_CHECK(cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                             1024, 56, 1024,
+                             &alpha, m.d_lilicorr_in_head, CUDA_R_32F, 1024,
+                             m.d_lilicorr_factors, CUDA_R_32F, 1024,
+                             &beta, m.d_lilicorr_in, CUDA_R_32F, 1024,
+                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    add_bias_and_l2_norm_kernel<<<56, 256, 0, stream>>>(
+        m.d_lilicorr_in, m.d_lilicorr_in_head_b, 1024, 56, 1e-4f);
+
+    // Anchor out head: [1024, 1024] x [1024, 1] -> [1024, 1]
+    CUBLAS_CHECK(cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                             1024, 1, 1024,
+                             &alpha, m.d_lilicorr_anchor_out_head, CUDA_R_32F, 1024,
+                             m.d_lilicorr_norm_anchor, CUDA_R_32F, 1024,
+                             &beta, m.d_lilicorr_anchor_out, CUDA_R_32F, 1024,
+                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    add_bias_and_l2_norm_kernel<<<1, 256, 0, stream>>>(
+        m.d_lilicorr_anchor_out, m.d_lilicorr_anchor_out_head_b, 1024, 1, 1e-4f);
+
+    // 7. Build Lattice
+    build_lilicorr_lattice_kernel<<<8, 256, 0, stream>>>(
+        m.d_lilicorr_cand_ids, m.d_lilicorr_anchor_out, m.d_lilicorr_in, m.d_lilicorr_out,
+        m.d_lilicorr_lattice, 8.0f);
+
+    // Copy lattice to host and greedily walk from predecessor 0
+    CUDA_CHECK(cudaMemcpyAsync(m.h_lattice.data(), m.d_lilicorr_lattice, 8 * 4096 * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
     std::vector<int32_t> draft_tokens(n_draft);
-    CUDA_CHECK(cudaMemcpyAsync(draft_tokens.data(), d_out_tokens, n_draft * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    int32_t predecessor = 0;
+    for (int i = 1; i <= n_draft; ++i) {
+        const float* row = m.h_lattice.data() + (size_t) i * 4096;
+        const float* scores = row + 8 + predecessor * 8;
+        int best_k = 0;
+        float best_s = scores[0];
+        for (int k = 1; k < 8; ++k) {
+            if (scores[k] > best_s) {
+                best_s = scores[k];
+                best_k = k;
+            }
+        }
+        predecessor = best_k;
+        draft_tokens[i - 1] = (int32_t) row[predecessor];
+    }
 
     auto t_end = std::chrono::steady_clock::now();
     m.last_ms = std::chrono::duration<float, std::milli>(t_end - t_start).count();
