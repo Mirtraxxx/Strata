@@ -532,4 +532,29 @@ __global__ void k_argmax(const float* x, int n, int32_t* out, float* pv, int32_t
     }
 }
 
+/// Grouped prompt experts: expert e's `n4` uint4s at src[e] + src_off land in dst's slot e (`stride4` uint4s apart).
+/// Up and down of an IQ expert are 16-byte aligned, so one copy covers up and, with src_off = down_off, down.
+__global__ void k_copy_experts(const uint8_t* const* __restrict__ src, int src_off, uint4* __restrict__ dst, int n4,
+                               int stride4) {
+    const int e = (int) blockIdx.y;
+    const uint4* s = (const uint4*) (src[e] + src_off);
+    uint4* d = dst + (size_t) e * (size_t) stride4;
+    for (int i = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x; i < n4; i += (int) blockDim.x * (int) gridDim.x)
+        d[i] = s[i];
+}
+
+/// One group's expert pointers and row bounds. Passed by value so the launch copies them; a reused pinned
+/// buffer would still be unread when the host fills the next group (the H2D stays queued behind the multiply).
+constexpr int kMmqStage = 32;
+struct MmqStage {
+    const uint8_t* ptr[kMmqStage];
+    int32_t bounds[kMmqStage + 1];
+    int n;
+};
+__global__ void k_stage_mmq(MmqStage s, const uint8_t** dst_ptr, int32_t* dst_bounds) {
+    const int i = (int) threadIdx.x;
+    if (i < s.n) dst_ptr[i] = s.ptr[i];
+    if (i <= s.n) dst_bounds[i] = s.bounds[i];
+}
+
 }  // namespace nh

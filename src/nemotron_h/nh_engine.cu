@@ -13,7 +13,7 @@
 //   * the routed experts are 78 GB: the hybrid mode always - per MoE layer the same number of VRAM slots, a batch of
 //     up to --hybrid-rows rows runs its resident experts on the GPU and the others on the CPU pool (ggml-cpu, read
 //     straight from the mapped GGUF), a bigger prompt chunk streams every non-resident expert through a ring of
-//     VRAM buffers (a copy thread feeding a copy stream) into per-expert FP16 GEMMs;
+//     VRAM buffers (a copy thread feeding a copy stream) into grouped IQ MMQ (the weights stay quantized);
 //   * the GGUF's MTP block (blk.88: eh_proj over [enorm(e) | hnorm(h)], attention, MoE, the LayerNorm head norm)
 //     drafts for greedy requests (--mtp N), verified by the main model (the Mamba state is committed afterwards);
 //   * images (GENI): strata-vision's rows (llama.cpp mtmd, the mmproj's RADIO tower + projector) in place of the
@@ -28,6 +28,9 @@
 #include "strata/nemotron_h/cpu_experts.hpp"
 #include "strata/nemotron_h/engine.hpp"
 #include "strata/prefill/gemm.hpp"
+#if defined(STRATA_PREFILL_MMQ)
+#include "strata/prefill/moe_mmq.hpp"
+#endif
 
 #include "nh_kernels.cuh"
 #include "nh_ssm_scan.cuh"
@@ -75,6 +78,9 @@
 namespace {
 
 namespace K = strata::kernels;
+#if defined(STRATA_PREFILL_MMQ)
+namespace MMQ = strata::prefill::mmq;
+#endif
 using namespace nh;
 
 #define CK(x)                                                                                                          \
@@ -824,6 +830,24 @@ struct Engine {
     cudaEvent_t ev_route = nullptr;
     ExpertStream xs;
     long xs_pos = 0;
+#if defined(STRATA_PREFILL_MMQ)
+    // Prompt chunks (T > hybrid_t): one MMQ launch per group of experts, weights read as IQ2_XXS.  STRATA_NH_EXPERT_MMQ=0
+    // keeps the per-expert FP16 GEMMs.  The group buffers are allocated here, before place_experts sizes the slots.
+    static constexpr int kMmqGroup = 32;
+    static constexpr int kMmqIdPad = 160;   // MMQ reads up to J (<= 128) ids past the last row
+    static constexpr int kMmqHold = 96;     // streamed experts held until a flush; capped again by the ring
+    bool mmq_on = false;
+    std::vector<char> mmq_ok;               // per MoE slot (main layers, then the MTP block)
+    std::unique_ptr<MMQ::Context> mmq_ctx;
+    uint8_t *mmq_up = nullptr, *mmq_dn = nullptr;
+    void* mmq_xq = nullptr;
+    int32_t* mmq_ids = nullptr;
+    int32_t* mmq_bounds = nullptr;
+    const uint8_t** mmq_ptrs = nullptr;
+    int mmq_rows_cap = 0;
+    size_t mmq_max_bytes = 0;
+    cudaEvent_t ev_moe_route = nullptr, ev_moe_cnt = nullptr;
+#endif
     long long hy_cpu = 0, hy_gpu = 0, hy_swaps = 0, hy_streamed = 0;
     double hy_cpu_ms = 0;
     bool warming = false;
@@ -970,6 +994,9 @@ struct Engine {
         d_miss = dalloc_t<int32_t>(T * Kp);
         init_transient();
         if (tmax > kSsmSsdMinTok) ssm_ws_reserve(ssm_ws, g.ssm_H, kSsmP, kSsmN, g.ssm_G, tmax);   // the prompt scan's scratch
+#if defined(STRATA_PREFILL_MMQ)
+        init_prompt_mmq();
+#endif
         CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming | cudaEventBlockingSync));
         CK(cudaDeviceSynchronize());
         size_t fr = 0, tot = 0;
@@ -1106,6 +1133,212 @@ struct Engine {
         }
         mm(L.wo, att, y, T);
     }
+
+#if defined(STRATA_PREFILL_MMQ)
+    /// Which layers can take the grouped IQ MMQ path (type, tile, byte layout).  A layer that fails stays on the
+    /// per-expert FP16 GEMMs.
+    void init_prompt_mmq() {
+        const char* env = std::getenv("STRATA_NH_EXPERT_MMQ");
+        const bool force_off = env != nullptr && std::strcmp(env, "0") == 0;
+        const Geo& g = m->g;
+        const int nmoe = m->n_moe + (m->has_mtp ? 1 : 0);
+        mmq_ok.assign((size_t) nmoe, 0);
+        if (!force_off && MMQ::built()) {
+            auto ok = [&](const Moe& M) {
+                if (!MMQ::supported(M.L.gu_type) || !MMQ::supported(M.L.d_type)) return false;
+                if (!MMQ::fits(M.L.gu_type, M.FF) || !MMQ::fits(M.L.d_type, g.LAT)) return false;
+                if (MMQ::matrix_bytes(M.L.gu_type, M.FF, g.LAT) != M.up_bytes) return false;
+                if (MMQ::matrix_bytes(M.L.d_type, g.LAT, M.FF) != M.d_bytes) return false;
+                if (((M.up_bytes | M.d_bytes | M.L.down_off) & 15) != 0) return false;
+                if (M.L.down_off != M.up_bytes || M.up_bytes == 0) return false;
+                return true;
+            };
+            for (const Layer& L : m->layers)
+                if (L.kind == Kind::Moe && ok(L.moe)) mmq_ok[(size_t) L.idx] = 1;
+            if (m->has_mtp && ok(m->mtp_moe.moe)) mmq_ok[(size_t) m->n_moe] = 1;
+            for (char c : mmq_ok)
+                if (c) mmq_on = true;
+        }
+        int n_ok = 0;
+        for (char c : mmq_ok) n_ok += c != 0;
+        if (!mmq_on) {
+            std::fprintf(stderr, "strata-nh: prompt MoE: per-expert FP16 GEMM\n");
+            return;
+        }
+        mmq_rows_cap = tmax;
+        for (const Layer& L : m->layers)
+            if (L.kind == Kind::Moe && mmq_ok[(size_t) L.idx])
+                mmq_max_bytes = std::max(mmq_max_bytes, std::max(L.moe.up_bytes, L.moe.d_bytes));
+        if (m->has_mtp && mmq_ok[(size_t) m->n_moe])
+            mmq_max_bytes = std::max(mmq_max_bytes, std::max(m->mtp_moe.moe.up_bytes, m->mtp_moe.moe.d_bytes));
+        const size_t wbytes = (size_t) kMmqGroup * mmq_max_bytes + kTail;
+        CK(cudaMalloc(&mmq_up, wbytes));
+        CK(cudaMalloc(&mmq_dn, wbytes));
+        CK(cudaMalloc(&mmq_xq, MMQ::q8_bytes(mmq_rows_cap, g.FF)));
+        mmq_ids = dalloc_t<int32_t>((size_t) mmq_rows_cap + kMmqIdPad);
+        mmq_bounds = dalloc_t<int32_t>((size_t) kMmqGroup + 1);
+        void* pptrs = nullptr;
+        CK(cudaMalloc(&pptrs, (size_t) kMmqGroup * sizeof(void*)));
+        mmq_ptrs = static_cast<const uint8_t**>(pptrs);
+        CK(cudaEventCreateWithFlags(&ev_moe_route, cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&ev_moe_cnt, cudaEventDisableTiming));
+        mmq_ctx = std::make_unique<MMQ::Context>();
+        CK(cudaDeviceSynchronize());   // dalloc's legacy-stream memsets before iota on st
+        MMQ::iota(mmq_ids, (int64_t) mmq_rows_cap + kMmqIdPad, st);
+        std::fprintf(stderr,
+                     "strata-nh: prompt MoE: grouped IQ MMQ (%d experts, weights stay quantized) on %d/%d MoE layers\n",
+                     kMmqGroup, n_ok, nmoe);
+    }
+
+    /// T > hybrid_t, one MoE layer: route counts come back on cst2 while the shared expert runs on st, then experts
+    /// with rows are grouped (at most kMmqGroup, and at most mmq_rows_cap rows).  Both matrices are copied out of the
+    /// ring slot before done(), so the next uploads overlap the multiply.  Down writes sorted rows of eparts.
+    void moe_stream_mmq(const Moe& M, int mi, int T) {
+        const Geo& g = m->g;
+        const int LAT = g.LAT, FF = M.FF, E_ = M.E;
+        const int n_ent = T * g.top_k;
+        Hy& Hh = hy[(size_t) mi];
+        CK(cudaEventRecord(ev_moe_route, st));
+        CK(cudaStreamWaitEvent(cst2, ev_moe_route, 0));
+        CK(cudaMemcpyAsync(h_cnt, rcnt, (size_t) E_ * 4, cudaMemcpyDeviceToHost, cst2));
+        CK(cudaEventRecord(ev_moe_cnt, cst2));
+        shared(M, T);   // hides the count copy; y2 is independent of the routed experts
+        CK(cudaEventSynchronize(ev_moe_cnt));
+
+        struct Exp {
+            const uint8_t* w;
+            int c;
+            long item;
+        };
+        Exp grp[kMmqGroup];
+        long pend[kMmqHold];
+        int ng = 0, np = 0, grows = 0, row0 = 0;
+        const int hold_lim = std::max(1, std::min(kMmqHold, xs.nr - 1));
+
+        auto flush = [&]() {
+            if (ng > 0) {
+                const uint8_t* hp[kMmqGroup];
+                int32_t hb[kMmqGroup + 1];
+                hb[0] = 0;
+                int rows = 0, mr = 0;
+                for (int i = 0; i < ng; ++i) {
+                    hp[i] = grp[i].w;
+                    rows += grp[i].c;
+                    hb[i + 1] = rows;
+                    if (grp[i].c > mr) mr = grp[i].c;
+                }
+                static_assert(kMmqGroup <= kMmqStage, "stage pack holds one group");
+                MmqStage stage{};
+                stage.n = ng;
+                for (int i = 0; i < ng; ++i) {
+                    stage.ptr[i] = hp[i];
+                    stage.bounds[i] = hb[i];
+                }
+                stage.bounds[ng] = hb[ng];
+                // by value: the driver copies `stage` at launch, so the next flush can reuse the host struct
+                k_stage_mmq<<<1, kMmqGroup + 1, 0, st>>>(stage, mmq_ptrs, mmq_bounds);
+                const int n4u = (int) (M.up_bytes / 16);
+                const int n4d = (int) (M.d_bytes / 16);
+                auto launch_copy = [&](int src_off, uint8_t* dst, int n4) {
+                    const unsigned gx = (unsigned) std::max(1, std::min(128, (n4 + kThreads - 1) / kThreads));
+                    k_copy_experts<<<dim3(gx, (unsigned) ng), kThreads, 0, st>>>(mmq_ptrs, src_off,
+                                                                                 reinterpret_cast<uint4*>(dst), n4, n4);
+                };
+                launch_copy(0, mmq_up, n4u);
+                launch_copy((int) M.L.down_off, mmq_dn, n4d);
+                CK(cudaMemsetAsync(mmq_up + (size_t) ng * M.up_bytes, 0, kTail, st));
+                CK(cudaMemsetAsync(mmq_dn + (size_t) ng * M.d_bytes, 0, kTail, st));
+                CK(cudaGetLastError());
+                // the copies are queued: the ring slots can be refilled while the products run
+                for (int i = 0; i < np; ++i) xs.done(pend[i], st);
+                np = 0;
+
+                MMQ::quantize(hl, ent_tok + row0, mmq_xq, M.L.gu_type, LAT, LAT, rows, st);
+                CK(cudaMemsetAsync(ubuf, 0, (size_t) rows * (size_t) FF * 4, st));
+                MMQ::Product up;
+                up.w = mmq_up;
+                up.type = M.L.gu_type;
+                up.w_rows = FF;
+                up.w_cols = LAT;
+                up.expert_bytes = M.up_bytes;
+                up.n = ng;
+                up.xq = mmq_xq;
+                up.bounds = mmq_bounds;
+                up.ids = mmq_ids;
+                up.total_rows = rows;
+                up.max_rows = mr;
+                up.dst = ubuf;
+                up.ld_dst = FF;
+                mmq_ctx->run(up, st);
+                k_relu2<<<grid1((int64_t) rows * FF), kThreads, 0, st>>>(ubuf, (int64_t) rows * FF);
+                MMQ::quantize(ubuf, nullptr, mmq_xq, M.L.d_type, FF, FF, rows, st);
+                CK(cudaMemsetAsync(eparts + (size_t) row0 * LAT, 0, (size_t) rows * (size_t) LAT * 4, st));
+                MMQ::Product dn;
+                dn.w = mmq_dn;
+                dn.type = M.L.d_type;
+                dn.w_rows = LAT;
+                dn.w_cols = FF;
+                dn.expert_bytes = M.d_bytes;
+                dn.n = ng;
+                dn.xq = mmq_xq;
+                dn.bounds = mmq_bounds;
+                dn.ids = mmq_ids;
+                dn.total_rows = rows;
+                dn.max_rows = mr;
+                dn.dst = eparts + (size_t) row0 * LAT;
+                dn.ld_dst = LAT;
+                mmq_ctx->run(dn, st);
+                row0 += rows;
+                ng = 0;
+                grows = 0;
+            } else if (np > 0) {
+                for (int i = 0; i < np; ++i) xs.done(pend[i], st);
+                np = 0;
+            }
+        };
+
+        for (int xid = 0; xid < E_; ++xid) {
+            const int c = h_cnt[xid];
+            if (c > mmq_rows_cap) {
+                std::fprintf(stderr, "strata-nh: expert %d has %d rows, the MMQ group holds %d\n", xid, c, mmq_rows_cap);
+                std::exit(1);
+            }
+            if (!warming) {
+                Hh.score[(size_t) xid] += c;
+                Hh.total[(size_t) xid] += c;
+            }
+            const bool res = Hh.slot_of[(size_t) xid] >= 0;
+            long item = -1;
+            const uint8_t* w = nullptr;
+            if (c <= 0) {
+                if (!res) {
+                    if (np >= hold_lim) flush();
+                    item = xs_pos++;
+                    (void) xs.take(item, st);
+                    ++hy_streamed;
+                    pend[np++] = item;
+                }
+                continue;
+            }
+            if (ng == kMmqGroup || (ng > 0 && grows + c > mmq_rows_cap) || (!res && np >= hold_lim)) flush();
+            if (!res) {
+                item = xs_pos++;
+                w = xs.take(item, st);
+                ++hy_streamed;
+                pend[np++] = item;
+            } else {
+                w = M.slots + (size_t) Hh.slot_of[(size_t) xid] * M.stride;
+            }
+            grp[ng++] = {w, c, item};
+            grows += c;
+        }
+        flush();
+        if (row0 != n_ent) {
+            std::fprintf(stderr, "strata-nh: MMQ grouped %d rows, expected %d\n", row0, n_ent);
+            std::exit(1);
+        }
+    }
+#endif
 
     /// The MoE block for T rows of h: y = latent_up(sum_k w_k expert_k(latent_down h)), y2 = the shared expert.
     void moe(const Layer& Lr, int T) {
@@ -1245,6 +1478,12 @@ struct Engine {
             k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, n_ent, rcnt);
             k_route_scan<<<1, 32, 0, st>>>(rcnt, E_, rbounds, rcur);
             k_route_scatter<<<grid1(n_ent), kThreads, 0, st>>>(ids, n_ent, Kp, rcur, ent_dst, ent_tok, rinv);
+#if defined(STRATA_PREFILL_MMQ)
+            if (mmq_on && mmq_ok[(size_t) mi]) {
+                moe_stream_mmq(M, mi, T);
+            } else
+#endif
+            {
             k_gather_f16<<<grid1((int64_t) n_ent * LAT), kThreads, 0, st>>>(hl, ent_tok, xg16, n_ent, LAT);
             CK(cudaMemcpyAsync(h_cnt, rcnt, (size_t) E_ * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
@@ -1270,8 +1509,9 @@ struct Engine {
                 if (!res) xs.done(item, st);
                 b0 += c;
             }
-            prow = rinv;
             shared(M, T);
+            }
+            prow = rinv;
         }
         k_combine<<<T, kThreads, 0, st>>>(eparts, prow, ewts, Kp, lat, LAT);
         mm(M.lat_up, lat, y, T);
