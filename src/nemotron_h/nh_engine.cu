@@ -56,7 +56,16 @@
 #include <tuple>
 #include <vector>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -74,6 +83,68 @@ using namespace nh;
             std::exit(1);                                                                                              \
         }                                                                                                              \
     } while (0)
+
+/// Free and total VRAM in bytes: cudaMemGetInfo capped by NVML's device-wide free memory (on Windows WDDM,
+/// cudaMemGetInfo reports this process's WDDM budget room and does not subtract all of the desktop's / other
+/// processes' allocations that nvidia-smi counts).
+void vram_info(size_t& fr, size_t& tot) {
+    CK(cudaMemGetInfo(&fr, &tot));
+    struct NvmlMem {
+        unsigned long long total, free, used;
+    };
+    struct Nvml {
+        using InitFn = int (*)();
+        using ByPciFn = int (*)(const char*, void**);
+        using ByIdxFn = int (*)(unsigned int, void**);
+        using MemFn = int (*)(void*, NvmlMem*);
+        ByPciFn by_pci = nullptr;
+        ByIdxFn by_idx = nullptr;
+        MemFn mem = nullptr;
+        bool ok = false;
+        Nvml() {
+#if defined(_WIN32)
+            HMODULE lib = LoadLibraryA("nvml.dll");
+            if (!lib) {
+                const char* pf = std::getenv("ProgramFiles");
+                const std::string p = std::string(pf ? pf : "C:\\Program Files") + "\\NVIDIA Corporation\\NVSMI\\nvml.dll";
+                lib = LoadLibraryA(p.c_str());
+            }
+            auto sym = [&](const char* n) -> void* { return lib ? (void*) GetProcAddress(lib, n) : nullptr; };
+#else
+            void* lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+            if (!lib) lib = dlopen("libnvidia-ml.so", RTLD_LAZY);
+            auto sym = [&](const char* n) -> void* { return lib ? dlsym(lib, n) : nullptr; };
+#endif
+            if (!lib) return;
+            auto init = (InitFn) (sym("nvmlInit_v2") ? sym("nvmlInit_v2") : sym("nvmlInit"));
+            by_pci = (ByPciFn) (sym("nvmlDeviceGetHandleByPciBusId_v2") ? sym("nvmlDeviceGetHandleByPciBusId_v2")
+                                                                        : sym("nvmlDeviceGetHandleByPciBusId"));
+            by_idx = (ByIdxFn) (sym("nvmlDeviceGetHandleByIndex_v2") ? sym("nvmlDeviceGetHandleByIndex_v2")
+                                                                     : sym("nvmlDeviceGetHandleByIndex"));
+            mem = (MemFn) sym("nvmlDeviceGetMemoryInfo");
+            ok = init && mem && (by_pci || by_idx) && init() == 0;
+        }
+    };
+    static Nvml nvml;
+    if (!nvml.ok) return;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    void* h = nullptr;
+    char pci[64] = {};
+    if (cudaDeviceGetPCIBusId(pci, sizeof pci, dev) != cudaSuccess || !nvml.by_pci || nvml.by_pci(pci, &h) != 0) {
+        (void) cudaGetLastError();
+        if (!nvml.by_idx || nvml.by_idx((unsigned int) dev, &h) != 0) return;
+    }
+    NvmlMem m{};
+    if (nvml.mem(h, &m) == 0 && m.total > 0) {
+        const size_t nf = m.total > m.used ? std::min<size_t>((size_t) m.free, (size_t) (m.total - m.used)) : (size_t) m.free;
+        fr = std::min<size_t>(fr, nf);
+        tot = (size_t) m.total;
+    }
+}
 
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
@@ -457,7 +528,7 @@ struct ExpertStream {
         slot = slot_bytes;
         CK(cudaMalloc(&ring, (size_t) nr * slot + kTail));
         CK(cudaMemset(ring, 0, (size_t) nr * slot + kTail));
-        if (!registered) CK(cudaHostAlloc((void**) &bounce, (size_t) nr * slot, cudaHostAllocDefault));
+        if (!registered) init_bounce();
         CK(cudaStreamCreateWithFlags(&cst, cudaStreamNonBlocking));
         ready.resize((size_t) nr);
         freed.resize((size_t) nr);
@@ -465,6 +536,9 @@ struct ExpertStream {
             CK(cudaEventCreateWithFlags(&ready[(size_t) i], cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&freed[(size_t) i], cudaEventDisableTiming));
         }
+    }
+    void init_bounce() {
+        if (!bounce) CK(cudaHostAlloc((void**) &bounce, (size_t) nr * slot, cudaHostAllocDefault));
     }
     void begin(std::vector<Item> items) {
         finish();
@@ -765,7 +839,7 @@ struct Engine {
         std::exit(1);
     }
 
-    void init(const Model& model, int ctx_, int tmax_) {
+    void init(const Model& model, int ctx_, int tmax_, int ring) {
         m = &model;
         ctx = ctx_;
         tmax = std::max(tmax_, kVerify);
@@ -792,7 +866,10 @@ struct Engine {
         xg16 = dalloc_t<__half>(T * Kp * g.LAT);
         hb16 = dalloc_t<__half>(T * g.FF);
         q16 = dalloc_t<__half>(T * g.H * kHD);
-        if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(blas, st) != CUBLAS_STATUS_SUCCESS) {
+        void* blas_ws = nullptr;
+        CK(cudaMalloc(&blas_ws, (size_t) 8 << 20));
+        if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(blas, st) != CUBLAS_STATUS_SUCCESS ||
+            cublasSetWorkspace(blas, blas_ws, (size_t) 8 << 20) != CUBLAS_STATUS_SUCCESS) {
             std::fprintf(stderr, "strata-nh: cuBLAS handle failed\n");
             std::exit(1);
         }
@@ -816,6 +893,12 @@ struct Engine {
                 std::fprintf(stderr, "strata-nh: prompt GEMM: %s\n", gerr.c_str());
                 std::exit(1);
             }
+            // touch both cuBLAS handles' FP16 GEMM paths now so their kernel modules are loaded before VRAM sizing
+            gemm.f16((const uint16_t*) x16, (const uint16_t*) x16, y, 16, 64, 64, 64);
+            const float one = 1.0f, zero = 0.0f;
+            (void) cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, 64, 16, kHD, &one, x16, CUDA_R_16F, kHD, 0,
+                                              q16, CUDA_R_16F, kHD, kHD, &zero, att_s, CUDA_R_32F, 64, 1024, 1,
+                                              CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
         }
         // the grouped kernels' scratch for a rows batch (at most hybrid_t rows: a bigger batch streams)
         const size_t rows_cap = (size_t) std::max(std::min(hybrid_t, tmax), kVerify);
@@ -856,11 +939,32 @@ struct Engine {
             kc.push_back(dalloc_t<__half>((size_t) g.HKV * ctx * kHD));
             vc.push_back(dalloc_t<__half>((size_t) g.HKV * ctx * kHD));
         }
+        size_t max_stride = 0;
+        for (const Layer& L : m->layers)
+            if (L.kind == Kind::Moe) max_stride = std::max(max_stride, L.moe.stride);
+        if (m->has_mtp) max_stride = std::max(max_stride, m->mtp_moe.moe.stride);
+        xs.dev = 0;
+        CK(cudaGetDevice(&xs.dev));
+        xs.init(std::max(4, ring), max_stride, true);
+        tr_stride = max_stride;
+        if (pcie_frac <= 0.f) pcie_cap = 0;   // the share off: no buffer (its VRAM goes to the slots)
+        if (pcie_cap > 0) pcbuf = dalloc_t<uint8_t>((size_t) pcie_cap * max_stride + kTail);
+        if (pf_cap > 0)
+            for (int b = 0; b < 2; ++b) pfbuf[b] = dalloc_t<uint8_t>((size_t) pf_cap * max_stride + kTail);
+        CK(cudaHostAlloc((void**) &h_hl, T * g.LAT * 4, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void**) &cpu_out, T * Kp * g.LAT * 4, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void**) &h_ids, T * Kp * 4, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void**) &h_miss, T * Kp * 4, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void**) &h_cnt, (size_t) g.E * 4, cudaHostAllocDefault));
+        ecpu = dalloc(T * Kp * g.LAT);
+        d_miss = dalloc_t<int32_t>(T * Kp);
+        init_transient();
+        CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming | cudaEventBlockingSync));
         CK(cudaDeviceSynchronize());
         size_t fr = 0, tot = 0;
-        CK(cudaMemGetInfo(&fr, &tot));
-        std::fprintf(stderr, "strata-nh: context %d cells (FP16 KV, %.2f GiB), prompt chunk %d, %.2f GiB of VRAM free\n",
-                     ctx, (double) kc.size() * 2 * g.HKV * ctx * kHD * 2 / (1 << 30), tmax, (double) fr / (1 << 30));
+        vram_info(fr, tot);
+        std::fprintf(stderr, "strata-nh: context %d cells (FP16 KV, %.2f GiB), prompt chunk %d, %.2f GiB (%zu MiB) of VRAM free\n",
+                     ctx, (double) kc.size() * 2 * g.HKV * ctx * kHD * 2 / (1 << 30), tmax, (double) fr / (1 << 30), fr >> 20);
     }
 
     void reset() {
@@ -1586,32 +1690,27 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int slots,
                          "is read\n", (double) avail / (1 << 30), (double) (total + keep) / (1 << 30));
         }
     }
-    E.xs.dev = 0;
-    CK(cudaGetDevice(&E.xs.dev));
-    E.xs.init(std::max(4, ring), max_stride, have_arena);
-    // ---- the transient buffers: the PCIe share's experts and two prefetch sets
-    E.tr_stride = max_stride;
-    if (E.pcie_frac <= 0.f) E.pcie_cap = 0;   // the share off: no buffer (its VRAM goes to the slots)
-    if (E.pcie_cap > 0) E.pcbuf = dalloc_t<uint8_t>((size_t) E.pcie_cap * max_stride + kTail);
-    if (E.pf_cap > 0)
-        for (int b = 0; b < 2; ++b) E.pfbuf[b] = dalloc_t<uint8_t>((size_t) E.pf_cap * max_stride + kTail);
-    const size_t T = (size_t) E.tmax, Kp = (size_t) g.top_k;
-    CK(cudaHostAlloc((void**) &E.h_hl, T * g.LAT * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.cpu_out, T * Kp * g.LAT * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.h_ids, T * Kp * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.h_miss, T * Kp * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.h_cnt, (size_t) g.E * 4, cudaHostAllocDefault));
-    E.ecpu = dalloc(T * Kp * g.LAT);
-    E.d_miss = dalloc_t<int32_t>(T * Kp);
-    E.init_transient();
-    CK(cudaEventCreateWithFlags(&E.ev_route, cudaEventDisableTiming | cudaEventBlockingSync));
+    if (!have_arena) E.xs.init_bounce();
+    std::vector<std::vector<double>> prof;
+    const bool have_prof = !profile.empty() && load_profile(profile, (int) all.size(), g.E, prof);
+    if (!profile.empty())
+        std::fprintf(stderr, "strata-nh: expert profile %s: %s\n", profile.c_str(), have_prof ? "loaded" : "not usable, slots start at 0 .. S-1");
+    E.hy.resize(all.size());
+    for (size_t mi = 0; mi < all.size(); ++mi) CK(cudaMalloc(&E.hy[mi].slot_of_d, (size_t) all[mi]->E * 4));
+    E.pool = std::make_unique<strata::nemotron_h::CpuExperts>(threads);
+    CK(cudaDeviceSynchronize());
     size_t fr = 0, tot = 0;
-    CK(cudaMemGetInfo(&fr, &tot));
+    vram_info(fr, tot);
     const size_t reserve = (size_t) std::max(256, reserve_mib) << 20;   // --vram-reserve-mib (the server's: 700)
-    const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30)) : (fr > reserve ? fr - reserve : 0);
+    const size_t target_free = reserve + ((size_t) 32 << 20);           // headroom for runtime/desktop jitter
+    const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30)) : (fr > target_free ? fr - target_free : 0);
+    constexpr size_t kAllocGran = (size_t) 2 << 20;
     auto vram_for = [&](int s) {
         size_t b = 0;
-        for (Moe* M : all) b += (size_t) std::max(std::min(M->E, s), 1) * M->stride + kTail + (size_t) M->E * 4;
+        for (Moe* M : all) {
+            const size_t nb = (size_t) std::max(std::min(M->E, s), 1) * M->stride + kTail;
+            b += (nb + kAllocGran - 1) & ~(kAllocGran - 1);
+        }
         return b;
     };
     int S_ = 0;
@@ -1620,19 +1719,38 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int slots,
     } else {
         while (S_ < g.E && vram_for(S_ + 1) <= budget) ++S_;
     }
-    std::vector<std::vector<double>> prof;
-    const bool have_prof = !profile.empty() && load_profile(profile, (int) all.size(), g.E, prof);
-    if (!profile.empty())
-        std::fprintf(stderr, "strata-nh: expert profile %s: %s\n", profile.c_str(), have_prof ? "loaded" : "not usable, slots start at 0 .. S-1");
-    E.hy.resize(all.size());
     size_t vram_slots = 0;
+    auto alloc_slots = [&]() {
+        vram_slots = 0;
+        for (Moe* M : all) {
+            const int ns = std::min(M->E, S_);
+            M->n_slots = ns;
+            vram_slots += (size_t) ns * M->stride;
+            const size_t nb = M->stride * (size_t) std::max(ns, 1) + kTail;
+            CK(cudaMalloc(&M->slots, nb));
+            CK(cudaMemset(M->slots, 0, nb));
+        }
+        CK(cudaDeviceSynchronize());
+        vram_info(fr, tot);
+    };
+    alloc_slots();
+    while (slots <= 0 && vram_gib < 0 && fr < target_free && S_ > 1) {
+        const size_t deficit = target_free - fr;
+        size_t step = 0;
+        for (Moe* M : all)
+            if (M->E >= S_) step += M->stride;
+        if (step == 0) step = per_slot;
+        const int drop = std::max(1, (int) ((deficit + step - 1) / step));
+        S_ = std::max(1, S_ - drop);
+        for (Moe* M : all) {
+            CK(cudaFree(M->slots));
+            M->slots = nullptr;
+        }
+        alloc_slots();
+    }
     for (size_t mi = 0; mi < all.size(); ++mi) {
         Moe& M = *all[mi];
-        const int ne = M.E, ns = std::min(ne, S_);
-        M.n_slots = ns;
-        vram_slots += (size_t) ns * M.stride;
-        CK(cudaMalloc(&M.slots, M.stride * (size_t) std::max(ns, 1) + kTail));
-        CK(cudaMemset(M.slots, 0, M.stride * (size_t) std::max(ns, 1) + kTail));
+        const int ne = M.E, ns = M.n_slots;
         std::vector<int> order((size_t) ne);
         for (int x = 0; x < ne; ++x) order[(size_t) x] = x;
         if (have_prof)
@@ -1662,23 +1780,23 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int slots,
         H.total.assign((size_t) ne, 0.0);
         if (have_prof)
             for (int x = 0; x < ne; ++x) H.total[(size_t) x] = prof[mi][(size_t) x];
-        CK(cudaMalloc(&H.slot_of_d, (size_t) ne * 4));
         CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
     }
-    E.pool = std::make_unique<strata::nemotron_h::CpuExperts>(threads);
     CK(cudaDeviceSynchronize());
+    vram_info(fr, tot);
     if (min_e == g.E)
         std::fprintf(stderr, "strata-nh: hybrid experts: %d of %d per layer in VRAM (%.2f GiB of %.2f GiB), a batch of <= %d rows "
                      "on the GPU + %d CPU threads (PCIe share %.2f, up to %d experts; prefetch %d), bigger chunks streamed through "
-                     "%d buffers (%.2f GiB); %.1f s\n", S_, g.E, (double) vram_slots / (1 << 30), (double) total / (1 << 30),
-                     E.hybrid_t, E.pool->threads(), E.pcie_frac, E.pcie_cap, E.pf_cap, E.xs.nr,
-                     (double) E.xs.nr * max_stride / (1 << 30), ms_since(t0) / 1000.0);
+                     "%d buffers (%.2f GiB), %.2f GiB (%zu MiB) of VRAM free; %.1f s\n", S_, g.E, (double) vram_slots / (1 << 30),
+                     (double) total / (1 << 30), E.hybrid_t, E.pool->threads(), E.pcie_frac, E.pcie_cap, E.pf_cap, E.xs.nr,
+                     (double) E.xs.nr * max_stride / (1 << 30), (double) fr / (1 << 30), fr >> 20, ms_since(t0) / 1000.0);
     else
         std::fprintf(stderr, "strata-nh: hybrid experts: up to %d of %d..%d per layer in VRAM (%.2f GiB of %.2f GiB), a batch of <= %d rows "
                      "on the GPU + %d CPU threads (PCIe share %.2f, up to %d experts; prefetch %d), bigger chunks streamed through "
-                     "%d buffers (%.2f GiB); %.1f s\n", S_, min_e, g.E, (double) vram_slots / (1 << 30), (double) total / (1 << 30),
-                     E.hybrid_t, E.pool->threads(), E.pcie_frac, E.pcie_cap, E.pf_cap, E.xs.nr,
-                     (double) E.xs.nr * max_stride / (1 << 30), ms_since(t0) / 1000.0);
+                     "%d buffers (%.2f GiB), %.2f GiB (%zu MiB) of VRAM free; %.1f s\n", S_, min_e, g.E, (double) vram_slots / (1 << 30),
+                     (double) total / (1 << 30), E.hybrid_t, E.pool->threads(), E.pcie_frac, E.pcie_cap, E.pf_cap, E.xs.nr,
+                     (double) E.xs.nr * max_stride / (1 << 30), (double) fr / (1 << 30), fr >> 20, ms_since(t0) / 1000.0);
+    (void) ring;
     (void) err;
     return true;
 }
@@ -2076,7 +2194,12 @@ int strata::nemotron_h::run(int argc, char** argv) {
         }
     }
     if (model.empty()) { std::fprintf(stderr, "strata-nh: --model is required\n"); return 2; }
-#if !defined(_WIN32)
+#if defined(_WIN32)
+    if (!std::getenv("CUDA_MODULE_LOADING")) {
+        _putenv("CUDA_MODULE_LOADING=EAGER");
+        SetEnvironmentVariableA("CUDA_MODULE_LOADING", "EAGER");
+    }
+#else
     setenv("CUDA_MODULE_LOADING", "EAGER", 0);
 #endif
     if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "strata-nh: --mtp takes 0 .. 7 drafts\n"); return 2; }
@@ -2099,7 +2222,7 @@ int strata::nemotron_h::run(int argc, char** argv) {
     E.adapt_every = adapt_every;
     E.adapt_swaps = adapt_swaps;
     (void) pin;
-    E.init(m, ctx, chunk);
+    E.init(m, ctx, chunk, ring);
     if (!place_experts(m, E, expert_vram, cpu_threads, expert_slots, ring, arena, reserve_mib, profile, err)) {
         std::fprintf(stderr, "strata-nh: %s\n", err.c_str());
         return 1;
