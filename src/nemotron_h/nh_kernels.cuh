@@ -37,6 +37,7 @@ template <int MaxWarps = 32>
 __device__ __forceinline__ float block_reduce_sum(float val, float* sh) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
+    __syncthreads();   // a previous call's sh[0] may still be read by other warps
     val = warp_reduce_sum(val);
     if (lane == 0) sh[warp] = val;
     __syncthreads();
