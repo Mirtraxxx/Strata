@@ -667,6 +667,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(strata-nh PRIVATE strata_nemotron_h ${_strata_gpu_runtime_target})
     target_link_libraries(strata PRIVATE strata_nemotron_h)
     target_compile_definitions(strata PRIVATE STRATA_HAVE_NEMOTRON_H=1)
+
+    # LiLiCorr DFlash speculative drafter (Nemotron-H / Bolt)
+    add_library(strata_nh_dflash STATIC src/nemotron_h/nh_dflash.cu)
+    target_include_directories(strata_nh_dflash PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/nemotron_h PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(strata_nh_dflash PRIVATE strata_prefill strata_kernels strata_artifact strata_warnings
+                          ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+    add_executable(nh_dflash_test tools/nemotron_h/nh_dflash_test.cpp)
+    target_include_directories(nh_dflash_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/nemotron_h ${_strata_gpu_include_directories})
+    target_link_libraries(nh_dflash_test PRIVATE strata_nh_dflash ${_strata_gpu_runtime_target})
   endif()
 
   if(STRATA_ENABLE_HIP)
