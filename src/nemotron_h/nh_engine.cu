@@ -53,6 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -1751,7 +1752,25 @@ struct Engine {
     /// One speculative step with D MTP drafts (greedy), src/qwen35's spec_step: `x_tok` is the next token (decided,
     /// not processed), `fix` the drafts the last window accepted (the MTP block redoes their rows first).  Returns
     /// the accepted count a; picks[0 .. a] are the window's picks.
-    int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks) {
+    /// Sampled verification: given the D drafts (the window's D + 1 logits rows are in `logits`), returns the
+    /// accepted count a and sets picks[0 .. a].  Null: greedy (the window's argmax picks).
+    using Judge = std::function<int(int D, const int32_t* drafts, int32_t* picks)>;
+    int judged(int D, const std::vector<int32_t>& drafts, int32_t* picks, const Judge* judge) {
+        if (judge) return (*judge)(D, drafts.data(), picks);
+        int a = 0;
+        while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+        for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        return a;
+    }
+    /// The first `rows` rows of `logits` (a verify window's) on the host, row-major.
+    void host_logits_rows(int rows, std::vector<float>& out) {
+        out.resize((size_t) rows * m->g.V);
+        CK(cudaMemcpyAsync(out.data(), logits, out.size() * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+    }
+
+    int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
+                  const Judge* judge = nullptr) {
         const int N = m->g.N;
         const int T0 = (int) fix.size() + 1;
         CK(cudaStreamSynchronize(st));
@@ -1791,9 +1810,7 @@ struct Engine {
         forward(T, pos, T, true);
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
-        int a = 0;
-        while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
-        for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        const int a = judged(D, drafts, picks, judge);
         commit(a + 1);
         CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         const int64_t before = pos;
@@ -1805,7 +1822,7 @@ struct Engine {
     /// One DFlash step: the drafter's block from `x_tok` (decided, not processed) at pos, D of its drafts verified
     /// in one window of D + 1 rows; the kept rows' features go into the drafter.  Returns the accepted count a;
     /// picks[0 .. a] are the window's picks.
-    int dflash_step(int x_tok, int D, std::vector<int32_t>& drafts, int32_t* picks) {
+    int dflash_step(int x_tok, int D, std::vector<int32_t>& drafts, int32_t* picks, const Judge* judge = nullptr) {
         const int N = m->g.N;
         CK(cudaStreamSynchronize(st));
         const std::vector<int32_t> blk = df->draft(x_tok, (int32_t) pos, nullptr, st);
@@ -1821,9 +1838,7 @@ struct Engine {
         forward(T, pos, T, true);
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
-        int a = 0;
-        while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
-        for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        const int a = judged(D, drafts, picks, judge);
         commit(a + 1);
         df->encode_and_inject_f16(feat16, a + 1, (int) pos, st);
         CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
@@ -1834,9 +1849,10 @@ struct Engine {
     }
     /// The drafts a speculative step offers (DFlash's, else the MTP block's; 0: no speculation)
     int spec_d() const { return df ? df_d : mtp_d; }
-    int spec_any(int x_tok, std::vector<int32_t>& fix, std::vector<int32_t>& drafts, int32_t* picks) {
-        if (df) return dflash_step(x_tok, df_d, drafts, picks);
-        return spec_step(x_tok, fix, mtp_d, drafts, picks);
+    int spec_any(int x_tok, std::vector<int32_t>& fix, std::vector<int32_t>& drafts, int32_t* picks,
+                 const Judge* judge = nullptr) {
+        if (df) return dflash_step(x_tok, df_d, drafts, picks, judge);
+        return spec_step(x_tok, fix, mtp_d, drafts, picks, judge);
     }
     /// The drafter on the GPU before the expert slots are sized: its weights (FP16), the shared embedding and head
     /// (the engine's own Q8_0 copies), the feature buffer, and one inject + draft so its lazy buffers exist too.
@@ -2343,7 +2359,10 @@ struct Sampling {
     bool needs_logits() const { return temperature > 0.f || repeat != 1.f || freq != 0.f || present != 0.f; }
 };
 
-int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
+/// The sampler's candidates and their weights (penalties, temperature, top-k, min-p, top-p applied; not
+/// normalized).  Temperature 0: the argmax alone.
+void candidates(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::vector<int>& idx,
+                std::vector<double>& p) {
     if (s.last_n != 0 && (s.repeat != 1.f || s.freq != 0.f || s.present != 0.f)) {
         std::map<int, int> cnt;
         const size_t from = s.last_n < 0 || (size_t) s.last_n >= hist.size() ? 0 : hist.size() - (size_t) s.last_n;
@@ -2354,13 +2373,17 @@ int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>
             v -= (float) c * s.freq + s.present;
         }
     }
-    if (s.temperature <= 0.f) return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+    if (s.temperature <= 0.f) {
+        idx.assign(1, (int) (std::max_element(lg.begin(), lg.end()) - lg.begin()));
+        p.assign(1, 1.0);
+        return;
+    }
     const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
-    std::vector<int> idx(lg.size());
+    idx.resize(lg.size());
     for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
     std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
     idx.resize((size_t) kk);
-    std::vector<double> p(idx.size());
+    p.assign(idx.size(), 0.0);
     const double mx = lg[(size_t) idx[0]];
     double sum = 0;
     for (size_t i = 0; i < idx.size(); ++i) sum += (p[i] = std::exp((lg[(size_t) idx[i]] - mx) / s.temperature));
@@ -2372,13 +2395,68 @@ int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>
         if (cum >= s.top_p) { keep = i + 1; break; }
     }
     keep = std::max<size_t>(1, keep);
+    idx.resize(keep);
+    p.resize(keep);
+}
+
+/// One draw from the candidates, `skip` (a rejected draft) left out.
+int draw(const std::vector<int>& idx, const std::vector<double>& p, int skip, std::mt19937_64& rng) {
     double tot = 0;
-    for (size_t i = 0; i < keep; ++i) tot += p[i];
+    for (size_t i = 0; i < idx.size(); ++i)
+        if (idx[i] != skip) tot += p[i];
+    if (tot <= 0) return idx[0];
     std::uniform_real_distribution<double> u(0.0, tot);
     double r = u(rng);
-    for (size_t i = 0; i < keep; ++i)
+    int last = idx[0];
+    for (size_t i = 0; i < idx.size(); ++i) {
+        if (idx[i] == skip) continue;
+        last = idx[i];
         if ((r -= p[i]) <= 0) return idx[i];
-    return idx[keep - 1];
+    }
+    return last;
+}
+
+int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
+    std::vector<int> idx;
+    std::vector<double> p;
+    candidates(lg, s, hist, idx, p);
+    return draw(idx, p, -1, rng);
+}
+
+/// Speculative sampling with a deterministic drafter (exact: the tokens come out distributed as plain sampling's):
+/// row i keeps draft i with the probability the sampler gives it there; a rejected draft's row samples again with
+/// that draft left out; when all D are kept, the last row samples the next token.  `hist` (the history so far) gets
+/// the kept drafts for the penalties and is restored.
+int spec_judge(const std::vector<float>& rows, int V, const Sampling& s, std::vector<int32_t>& hist,
+               std::mt19937_64& rng, int D, const int32_t* drafts, int32_t* picks) {
+    std::vector<float> lg;
+    std::vector<int> idx;
+    std::vector<double> p;
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+    const size_t h0 = hist.size();
+    int a = 0;
+    for (;; ++a) {
+        lg.assign(rows.begin() + (size_t) a * V, rows.begin() + (size_t) (a + 1) * V);
+        candidates(lg, s, hist, idx, p);
+        if (a == D) {
+            picks[a] = draw(idx, p, -1, rng);
+            break;
+        }
+        double tot = 0, px = 0;
+        for (size_t i = 0; i < idx.size(); ++i) {
+            tot += p[i];
+            if (idx[i] == drafts[a]) px = p[i];
+        }
+        if (u01(rng) * tot < px) {
+            picks[a] = drafts[a];
+            hist.push_back(drafts[a]);
+            continue;
+        }
+        picks[a] = draw(idx, p, drafts[a], rng);
+        break;
+    }
+    hist.resize(h0);
+    return a;
 }
 
 std::vector<int32_t> parse_ids(const char* s) {
@@ -2612,13 +2690,20 @@ int serve(Engine& E) {
         const auto d0 = Clock::now();
         long long produced = 0, offered = 0, accepted = 0;
         const char* finish = "length";
-        const bool spec = E.spec_d() > 0 && !smp.needs_logits();
+        const bool spec = E.spec_d() > 0;
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
+        std::vector<float> rows;
+        Engine::Judge judge = [&](int D, const int32_t* dr, int32_t* pk) {
+            E.host_logits_rows(D + 1, rows);
+            return spec_judge(rows, E.m->g.V, smp, hist, rng, D, dr, pk);
+        };
+        const Engine::Judge* jp = smp.needs_logits() ? &judge : nullptr;
         int nx = smp.needs_logits() ? -1 : E.greedy();
+        bool have_nx = !smp.needs_logits();
         bool done = false;
         while (!done) {
-            if (smp.needs_logits()) {
+            if (!have_nx) {
                 E.host_logits(lg);
                 nx = sample(lg, smp, hist, rng);
             }
@@ -2634,7 +2719,7 @@ int serve(Engine& E) {
             };
             if (!emit(nx)) break;
             if (spec && E.pos + E.spec_d() + 1 <= E.ctx) {
-                const int a = E.spec_any(nx, fix, drafts, picks);
+                const int a = E.spec_any(nx, fix, drafts, picks, jp);
                 offered += E.spec_d();
                 accepted += a;
                 live.push_back(nx);
@@ -2644,6 +2729,7 @@ int serve(Engine& E) {
                     if (!emit(drafts[(size_t) i])) { done = true; break; }
                 }
                 nx = picks[a];
+                have_nx = true;
                 continue;
             }
             if (E.pos + 1 > E.ctx) break;
@@ -2651,7 +2737,8 @@ int serve(Engine& E) {
             E.process(&one, 1, [](int64_t) {});
             live.push_back(nx);
             fix.clear();
-            if (!smp.needs_logits()) nx = E.greedy();
+            have_nx = !smp.needs_logits();
+            if (have_nx) nx = E.greedy();
         }
         const double decode_ms = ms_since(d0);
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
@@ -2669,12 +2756,12 @@ int strata::nemotron_h::run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, dump_layers;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 64;
     std::string dflash;
-    int dflash_d = 7;
+    int dflash_d = 4;   // bench/RESULTS.md 2026-10-17 dfsweep-2: D = 4 best on chat, within 5% of D = 5 on code
     // the PCIe share and the prefetch are off by default: measured on the RTX 3090 + i7-7800X (DDR4-2133, quad
     // channel) the CPU experts already read RAM at its ceiling (~40 GB/s), and the uploads read the same RAM
     // (docs/NEMOTRON_H.md); a faster PCIe link or a slower CPU is where they pay
     int expert_slots = 0, ring = 64, reserve_mib = 1024, pcie_max = 48, prefetch = 0;
-    float pcie_frac = 0.f;
+    float pcie_frac = -1.f;   // unset: 0.5 with DFlash (its 5-row verify shares many experts: 61 -> 72 tok/s), else 0
     bool arena = true;
     std::string profile, profile_save;
     int adapt_every = 32, adapt_swaps = 8;
@@ -2735,9 +2822,9 @@ int strata::nemotron_h::run(int argc, char** argv) {
         } else {
             std::fprintf(stderr,
                          "usage: strata-nh --model GGUF [--max-context 32768] [--chunk 1024] [--mtp N] [--expert-vram GiB]\n"
-                         "       [--dflash GGUF] [--dflash-d 7]\n"
+                         "       [--dflash GGUF] [--dflash-d 4]\n"
                          "       [--expert-slots N] [--hybrid-rows 64] [--cpu-threads N] [--stream-ring 64] [--pin-experts]\n"
-                         "       [--vram-reserve-mib 1024] [--pcie-frac 0] [--pcie-max 48] [--prefetch 0] [--no-arena]\n"
+                         "       [--vram-reserve-mib 1024] [--pcie-frac 0, 0.5 with --dflash] [--pcie-max 48] [--prefetch 0] [--no-arena]\n"
                          "       [--expert-profile F] [--expert-profile-save F] [--adapt-every 32] [--adapt-swaps 8]\n"
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] [--dump-layers F] |\n"
                          "        --bench-pp N --bench-tg N)\n");
@@ -2766,6 +2853,7 @@ int strata::nemotron_h::run(int argc, char** argv) {
     }
     Engine E;
     E.hybrid_t = std::max(1, std::min(hybrid_rows, chunk));
+    if (pcie_frac < 0.f) pcie_frac = dflash.empty() ? 0.f : 0.5f;
     E.pcie_frac = std::max(0.f, std::min(1.f, pcie_frac));
     E.pcie_cap = std::max(0, pcie_max);
     E.pf_cap = std::max(0, prefetch);
