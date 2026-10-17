@@ -604,6 +604,15 @@ struct ExpertStream {
         CK(cudaStreamWaitEvent(st, ready[(size_t) s], 0));
         return ring + (size_t) s * slot;
     }
+    /// Same host wait as take(), but no stream wait.  The prompt MMQ copier waits for ready[] on its own stream.
+    const uint8_t* pointer(long i) {
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, [&] { return enq.load() > i; });
+        }
+        return ring + (size_t) (i % nr) * slot;
+    }
+    int slot_index(long i) const { return (int) (i % nr); }
     void done(long i, cudaStream_t st) {
         CK(cudaEventRecord(freed[(size_t) (i % nr)], st));
         {
@@ -644,6 +653,55 @@ __global__ void k_feat16(const float* __restrict__ x, int N, __half* __restrict_
     __half* d = dst + (size_t) blockIdx.x * ld;
     for (int i = threadIdx.x; i < N; i += blockDim.x) d[i] = __float2half(r[i]);
 }
+
+/// STRATA_NH_PROF=1: cuda events on the prompt stream, resolved once per forward.  Off for speed runs.
+struct Prof {
+    enum Ph { MambaIn, MambaConv, MambaScan, MambaGate, MambaOut, AddNorm, Attn, MoePre, MoeShared, MoeExperts, MoeLat, Other, NPh };
+    static constexpr int kMax = 1024;
+    bool on = false;
+    cudaEvent_t ev[kMax]{};
+    int phase[kMax]{};
+    int n = 0;
+    static const char* name(int p) {
+        static const char* nm[NPh] = {"mamba_in", "mamba_conv", "mamba_scan", "mamba_gate", "mamba_out", "add_norm",
+                                      "attn", "moe_pre", "moe_shared", "moe_experts", "moe_lat", "other"};
+        return nm[p];
+    }
+    void init() {
+        const char* e = std::getenv("STRATA_NH_PROF");
+        on = e != nullptr && std::strcmp(e, "1") == 0;
+        if (!on) return;
+        for (int i = 0; i < kMax; ++i) CK(cudaEventCreate(&ev[i]));
+    }
+    void begin(cudaStream_t st) {
+        if (!on) return;
+        CK(cudaEventRecord(ev[0], st));
+        n = 1;
+    }
+    void mark(cudaStream_t st, int ph) {
+        if (!on || n <= 0 || n >= kMax) return;
+        phase[n] = ph;
+        CK(cudaEventRecord(ev[n], st));
+        ++n;
+    }
+    void finish() {
+        if (!on || n < 2) { n = 0; return; }
+        CK(cudaEventSynchronize(ev[n - 1]));
+        double local[NPh] = {};
+        double sum = 0;
+        for (int i = 1; i < n; ++i) {
+            float t = 0;
+            CK(cudaEventElapsedTime(&t, ev[i - 1], ev[i]));
+            local[phase[i]] += (double) t;
+            sum += (double) t;
+        }
+        n = 0;
+        std::fprintf(stderr, "strata-nh: prof");
+        for (int i = 0; i < NPh; ++i)
+            if (local[i] >= 0.05) std::fprintf(stderr, " %s %.1f", name(i), local[i]);
+        std::fprintf(stderr, " (%.1f ms)\n", sum);
+    }
+};
 
 struct Engine {
     const Model* m = nullptr;
@@ -868,18 +926,24 @@ struct Engine {
     bool mmq_on = false;
     std::vector<char> mmq_ok;               // per MoE slot (main layers, then the MTP block)
     std::unique_ptr<MMQ::Context> mmq_ctx;
-    uint8_t *mmq_up = nullptr, *mmq_dn = nullptr;
+    uint8_t* mmq_up_b[2] = {};
+    uint8_t* mmq_dn_b[2] = {};
     void* mmq_xq = nullptr;
     int32_t* mmq_ids = nullptr;
-    int32_t* mmq_bounds = nullptr;
-    const uint8_t** mmq_ptrs = nullptr;
+    int32_t* mmq_bounds_b[2] = {};
+    const uint8_t** mmq_ptrs_b[2] = {};
     int mmq_rows_cap = 0;
     size_t mmq_max_bytes = 0;
     cudaEvent_t ev_moe_route = nullptr, ev_moe_cnt = nullptr;
+    cudaStream_t cst_cp = nullptr;                 // copies the next expert group while st multiplies the previous one
+    cudaEvent_t ev_cp[2] = {}, ev_mmq_done[2] = {};
+    bool mmq_buf_live[2] = {};
+    int mmq_buf = 0;
 #endif
     long long hy_cpu = 0, hy_gpu = 0, hy_swaps = 0, hy_streamed = 0;
     double hy_cpu_ms = 0;
     bool warming = false;
+    Prof prof;
     int adapt_every = 32, adapt_swaps = 8;   // --adapt-every / --adapt-swaps: the decode's slot replacements
     int swaps_after_prompt = 512;
     // POST /v1/vram (the server's `VRAM <reserve_mib>`): the startup slot count is the ceiling.  A shrink frees
@@ -1026,6 +1090,7 @@ struct Engine {
 #if defined(STRATA_PREFILL_MMQ)
         init_prompt_mmq();
 #endif
+        prof.init();
         CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming | cudaEventBlockingSync));
         CK(cudaDeviceSynchronize());
         size_t fr = 0, tot = 0;
@@ -1063,8 +1128,13 @@ struct Engine {
     void apply(const Mat& w, const void* q, float* out, int T) {
         if (T > kGemmT) gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
         else mmq(w, q, out, T);
-        if (w.scale != 1.0f)
-            k_scale<<<grid1((int64_t) T * w.n_out), kThreads, 0, st>>>(out, w.scale, (int64_t) T * w.n_out);
+        if (w.scale != 1.0f) {
+            const int64_t n = (int64_t) T * w.n_out;
+            if (T > 64 && n % 4 == 0 && (reinterpret_cast<uintptr_t>(out) & 15) == 0)
+                k_scale4<<<grid1(n / 4), kThreads, 0, st>>>(out, w.scale, n / 4);
+            else
+                k_scale<<<grid1(n), kThreads, 0, st>>>(out, w.scale, n);
+        }
     }
     void mm(const Mat& w, const float* xin, float* out, int T) {
         prep(xin, w.n_in, T, q8);
@@ -1092,17 +1162,30 @@ struct Engine {
         const Geo& g = m->g;
         const int li = L.idx;
         mm(L.ssm_in, h, zx, T);   // [T][z 8192 | xBC 10240 | dt 128]
+        prof.mark(st, Prof::MambaIn);
         const int vcols = g.in_proj - g.ssm_inner;
         if (verify)   // the window's xBC | dt rows, for the commit
             CK(cudaMemcpy2DAsync(vbuf[(size_t) li], (size_t) vcols * 4, zx + g.ssm_inner, (size_t) g.in_proj * 4,
                                  (size_t) vcols * 4, (size_t) T, cudaMemcpyDeviceToDevice, st));
-        k_conv<<<grid1(g.conv_ch, 128), 128, 0, st>>>(conv[(size_t) li], zx + g.ssm_inner, g.in_proj, L.conv_w, L.conv_b, xc,
-                                                      g.conv_ch, T, !verify);
+        if (T > 64) {
+            k_conv_prompt<64><<<dim3(grid1(g.conv_ch, 128), (unsigned) ((T + 63) / 64)), 128, 0, st>>>(
+                conv[(size_t) li], zx + g.ssm_inner, g.in_proj, L.conv_w, L.conv_b, xc, g.conv_ch, T);
+            if (!verify)
+                k_conv_save_hist<<<grid1(g.conv_ch, 128), 128, 0, st>>>(conv[(size_t) li], zx + g.ssm_inner, g.in_proj,
+                                                                       g.conv_ch, T);
+        } else {
+            k_conv<<<grid1(g.conv_ch, 128), 128, 0, st>>>(conv[(size_t) li], zx + g.ssm_inner, g.in_proj, L.conv_w, L.conv_b,
+                                                          xc, g.conv_ch, T, !verify);
+        }
+        prof.mark(st, Prof::MambaConv);
         ssm_scan(S[(size_t) li], xc, g.conv_ch, zx + g.ssm_inner + g.conv_ch, g.in_proj, L.dt_b, L.A, L.D, yr, g.ssm_H,
                  g.ssm_G, kSsmP, kSsmN, T, !verify, ssm_ws, st, blas);
+        prof.mark(st, Prof::MambaScan);
         k_gate_norm<<<dim3(g.ssm_G, T), kThreads, 0, st>>>(yr, zx, g.in_proj, L.ssm_norm, yg, g.ssm_inner,
                                                            g.ssm_inner / g.ssm_G, g.eps);
+        prof.mark(st, Prof::MambaGate);
         mm(L.ssm_out, yg, y, T);
+        prof.mark(st, Prof::MambaOut);
     }
 
     void attention(const Layer& L, int T, int64_t p0, const int32_t* dpos) {
@@ -1202,21 +1285,26 @@ struct Engine {
         if (m->has_mtp && mmq_ok[(size_t) m->n_moe])
             mmq_max_bytes = std::max(mmq_max_bytes, std::max(m->mtp_moe.moe.up_bytes, m->mtp_moe.moe.d_bytes));
         const size_t wbytes = (size_t) kMmqGroup * mmq_max_bytes + kTail;
-        CK(cudaMalloc(&mmq_up, wbytes));
-        CK(cudaMalloc(&mmq_dn, wbytes));
+        for (int b = 0; b < 2; ++b) {
+            CK(cudaMalloc(&mmq_up_b[b], wbytes));
+            CK(cudaMalloc(&mmq_dn_b[b], wbytes));
+            mmq_bounds_b[b] = dalloc_t<int32_t>((size_t) kMmqGroup + 1);
+            void* pptrs = nullptr;
+            CK(cudaMalloc(&pptrs, (size_t) kMmqGroup * sizeof(void*)));
+            mmq_ptrs_b[b] = static_cast<const uint8_t**>(pptrs);
+            CK(cudaEventCreateWithFlags(&ev_cp[b], cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&ev_mmq_done[b], cudaEventDisableTiming));
+        }
+        CK(cudaStreamCreateWithFlags(&cst_cp, cudaStreamNonBlocking));
         CK(cudaMalloc(&mmq_xq, MMQ::q8_bytes(mmq_rows_cap, g.FF)));
         mmq_ids = dalloc_t<int32_t>((size_t) mmq_rows_cap + kMmqIdPad);
-        mmq_bounds = dalloc_t<int32_t>((size_t) kMmqGroup + 1);
-        void* pptrs = nullptr;
-        CK(cudaMalloc(&pptrs, (size_t) kMmqGroup * sizeof(void*)));
-        mmq_ptrs = static_cast<const uint8_t**>(pptrs);
         CK(cudaEventCreateWithFlags(&ev_moe_route, cudaEventDisableTiming));
         CK(cudaEventCreateWithFlags(&ev_moe_cnt, cudaEventDisableTiming));
         mmq_ctx = std::make_unique<MMQ::Context>();
         CK(cudaDeviceSynchronize());   // dalloc's legacy-stream memsets before iota on st
         MMQ::iota(mmq_ids, (int64_t) mmq_rows_cap + kMmqIdPad, st);
         std::fprintf(stderr,
-                     "strata-nh: prompt MoE: grouped IQ MMQ (%d experts, weights stay quantized) on %d/%d MoE layers\n",
+                     "strata-nh: prompt MoE: grouped IQ MMQ (%d experts, weights stay quantized, copies double-buffered) on %d/%d MoE layers\n",
                      kMmqGroup, n_ok, nmoe);
     }
 
@@ -1233,6 +1321,7 @@ struct Engine {
         CK(cudaMemcpyAsync(h_cnt, rcnt, (size_t) E_ * 4, cudaMemcpyDeviceToHost, cst2));
         CK(cudaEventRecord(ev_moe_cnt, cst2));
         shared(M, T);   // hides the count copy; y2 is independent of the routed experts
+        prof.mark(st, Prof::MoeShared);
         CK(cudaEventSynchronize(ev_moe_cnt));
 
         struct Exp {
@@ -1265,35 +1354,42 @@ struct Engine {
                     stage.bounds[i] = hb[i];
                 }
                 stage.bounds[ng] = hb[ng];
-                // by value: the driver copies `stage` at launch, so the next flush can reuse the host struct
-                k_stage_mmq<<<1, kMmqGroup + 1, 0, st>>>(stage, mmq_ptrs, mmq_bounds);
+                // Copies land in buffer b on cst_cp.  st waits for ev_cp[b] before the multiply, and the next user
+                // of b waits for ev_mmq_done[b] first, so the multiply still owns the buffer.  done() is recorded on
+                // cst_cp after that wait and the copy, or the ring would reuse a slot whose upload is still in flight.
+                const int b = mmq_buf;
+                if (mmq_buf_live[b]) CK(cudaStreamWaitEvent(cst_cp, ev_mmq_done[b], 0));
+                for (int i = 0; i < np; ++i)
+                    CK(cudaStreamWaitEvent(cst_cp, xs.ready[(size_t) xs.slot_index(pend[i])], 0));
+                k_stage_mmq<<<1, kMmqGroup + 1, 0, cst_cp>>>(stage, mmq_ptrs_b[b], mmq_bounds_b[b]);
                 const int n4u = (int) (M.up_bytes / 16);
                 const int n4d = (int) (M.d_bytes / 16);
                 auto launch_copy = [&](int src_off, uint8_t* dst, int n4) {
                     const unsigned gx = (unsigned) std::max(1, std::min(128, (n4 + kThreads - 1) / kThreads));
-                    k_copy_experts<<<dim3(gx, (unsigned) ng), kThreads, 0, st>>>(mmq_ptrs, src_off,
-                                                                                 reinterpret_cast<uint4*>(dst), n4, n4);
+                    k_copy_experts<<<dim3(gx, (unsigned) ng), kThreads, 0, cst_cp>>>(mmq_ptrs_b[b], src_off,
+                                                                                     reinterpret_cast<uint4*>(dst), n4, n4);
                 };
-                launch_copy(0, mmq_up, n4u);
-                launch_copy((int) M.L.down_off, mmq_dn, n4d);
-                CK(cudaMemsetAsync(mmq_up + (size_t) ng * M.up_bytes, 0, kTail, st));
-                CK(cudaMemsetAsync(mmq_dn + (size_t) ng * M.d_bytes, 0, kTail, st));
-                CK(cudaGetLastError());
-                // the copies are queued: the ring slots can be refilled while the products run
-                for (int i = 0; i < np; ++i) xs.done(pend[i], st);
+                launch_copy(0, mmq_up_b[b], n4u);
+                launch_copy((int) M.L.down_off, mmq_dn_b[b], n4d);
+                CK(cudaMemsetAsync(mmq_up_b[b] + (size_t) ng * M.up_bytes, 0, kTail, cst_cp));
+                CK(cudaMemsetAsync(mmq_dn_b[b] + (size_t) ng * M.d_bytes, 0, kTail, cst_cp));
+                CK(cudaEventRecord(ev_cp[b], cst_cp));
+                for (int i = 0; i < np; ++i) xs.done(pend[i], cst_cp);
                 np = 0;
+                CK(cudaGetLastError());
 
                 MMQ::quantize(hl, ent_tok + row0, mmq_xq, M.L.gu_type, LAT, LAT, rows, st);
+                CK(cudaStreamWaitEvent(st, ev_cp[b], 0));
                 CK(cudaMemsetAsync(ubuf, 0, (size_t) rows * (size_t) FF * 4, st));
                 MMQ::Product up;
-                up.w = mmq_up;
+                up.w = mmq_up_b[b];
                 up.type = M.L.gu_type;
                 up.w_rows = FF;
                 up.w_cols = LAT;
                 up.expert_bytes = M.up_bytes;
                 up.n = ng;
                 up.xq = mmq_xq;
-                up.bounds = mmq_bounds;
+                up.bounds = mmq_bounds_b[b];
                 up.ids = mmq_ids;
                 up.total_rows = rows;
                 up.max_rows = mr;
@@ -1304,25 +1400,31 @@ struct Engine {
                 MMQ::quantize(ubuf, nullptr, mmq_xq, M.L.d_type, FF, FF, rows, st);
                 CK(cudaMemsetAsync(eparts + (size_t) row0 * LAT, 0, (size_t) rows * (size_t) LAT * 4, st));
                 MMQ::Product dn;
-                dn.w = mmq_dn;
+                dn.w = mmq_dn_b[b];
                 dn.type = M.L.d_type;
                 dn.w_rows = LAT;
                 dn.w_cols = FF;
                 dn.expert_bytes = M.d_bytes;
                 dn.n = ng;
                 dn.xq = mmq_xq;
-                dn.bounds = mmq_bounds;
+                dn.bounds = mmq_bounds_b[b];
                 dn.ids = mmq_ids;
                 dn.total_rows = rows;
                 dn.max_rows = mr;
                 dn.dst = eparts + (size_t) row0 * LAT;
                 dn.ld_dst = LAT;
                 mmq_ctx->run(dn, st);
+                CK(cudaEventRecord(ev_mmq_done[b], st));
+                mmq_buf_live[b] = true;
+                mmq_buf ^= 1;
                 row0 += rows;
                 ng = 0;
                 grows = 0;
             } else if (np > 0) {
-                for (int i = 0; i < np; ++i) xs.done(pend[i], st);
+                for (int i = 0; i < np; ++i) {
+                    CK(cudaStreamWaitEvent(cst_cp, xs.ready[(size_t) xs.slot_index(pend[i])], 0));
+                    xs.done(pend[i], cst_cp);
+                }
                 np = 0;
             }
         };
@@ -1344,7 +1446,7 @@ struct Engine {
                 if (!res) {
                     if (np >= hold_lim) flush();
                     item = xs_pos++;
-                    (void) xs.take(item, st);
+                    (void) xs.pointer(item);
                     ++hy_streamed;
                     pend[np++] = item;
                 }
@@ -1353,7 +1455,7 @@ struct Engine {
             if (ng == kMmqGroup || (ng > 0 && grows + c > mmq_rows_cap) || (!res && np >= hold_lim)) flush();
             if (!res) {
                 item = xs_pos++;
-                w = xs.take(item, st);
+                w = xs.pointer(item);
                 ++hy_streamed;
                 pend[np++] = item;
             } else {
@@ -1363,6 +1465,7 @@ struct Engine {
             grows += c;
         }
         flush();
+        prof.mark(st, Prof::MoeExperts);
         if (row0 != n_ent) {
             std::fprintf(stderr, "strata-nh: MMQ grouped %d rows, expected %d\n", row0, n_ent);
             std::exit(1);
@@ -1380,6 +1483,7 @@ struct Engine {
         k_route<<<T, 512, 0, st>>>(logits_r, M.bias, E_, Kp, g.w_scale, g.w_norm, ids, ewts);
         prep(h, N, T, xq);                     // (h's image serves the latent and the shared expert's up)
         apply(M.lat_down, xq, hl, T);
+        prof.mark(st, Prof::MoePre);
         const int32_t* prow = nullptr;
         if (T <= hybrid_t) {
             // ---- rows: the resident experts on the GPU, the others on the CPU pool, side by side
@@ -1539,12 +1643,15 @@ struct Engine {
                 if (!res) xs.done(item, st);
                 b0 += c;
             }
+            prof.mark(st, Prof::MoeExperts);
             shared(M, T);
+            prof.mark(st, Prof::MoeShared);
             }
             prow = rinv;
         }
         k_combine<<<T, kThreads, 0, st>>>(eparts, prow, ewts, Kp, lat, LAT);
         mm(M.lat_up, lat, y, T);
+        prof.mark(st, Prof::MoeLat);
     }
     /// y2 = down(relu(up h)^2), h's image already in xq / x16 (prep in moe)
     void shared(const Moe& M, int T) {
@@ -1585,10 +1692,12 @@ struct Engine {
             std::vector<int> mis;
             for (int i = 0; i < m->n_moe; ++i) mis.push_back(i);
             stream_plan(mis);
+            prof.begin(st);
         }
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok, T, N, x, st);
         embed_inject(x, T, p0);
         k_rms_ld<<<T, kThreads, 0, st>>>(x, N, m->layers[0].norm, h, N, N, g.eps);
+        prof.mark(st, Prof::Other);
         const size_t nl = m->layers.size();
         if (dump_f) dump_buf.assign(nl * (size_t) T * N, 0.f);
         for (size_t l = 0; l < m->layers.size(); ++l) {
@@ -1608,14 +1717,18 @@ struct Engine {
             if (L.kind == Kind::Mamba) {
                 mamba(L, T, verify);
                 k_add_norm<<<T, kThreads, 0, st>>>(x, y, nullptr, wn, hout, N, g.eps, false);
+                prof.mark(st, Prof::AddNorm);
                 if (pfn) prefetch_issue(m->layers[l + 1], T);
             } else if (L.kind == Kind::Attn) {
                 attention(L, T, p0, pos0);
+                prof.mark(st, Prof::Attn);
                 k_add_norm<<<T, kThreads, 0, st>>>(x, y, nullptr, wn, hout, N, g.eps, false);
+                prof.mark(st, Prof::AddNorm);
                 if (pfn) prefetch_issue(m->layers[l + 1], T);
             } else {
                 moe(L, T);
                 k_add_norm<<<T, kThreads, 0, st>>>(x, y, y2, wn, hout, N, g.eps, false);
+                prof.mark(st, Prof::AddNorm);
             }
             if (dump_f)
                 CK(cudaMemcpyAsync(dump_buf.data() + l * (size_t) T * N, x, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
@@ -1626,7 +1739,11 @@ struct Engine {
                 for (size_t l = 0; l < nl; ++l) std::fwrite(dump_buf.data() + (l * (size_t) T + t) * N, 4, (size_t) N, dump_f);
         }
         if (T > hybrid_t) xs.finish();
-        if (heads > 0) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
+        if (heads > 0) {
+            head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
+            prof.mark(st, Prof::Other);
+        }
+        if (T > hybrid_t) prof.finish();
     }
     void head_rows(const float* hn, int n, float* lg, int32_t* pk) {
         mm(m->head, hn, lg, n);

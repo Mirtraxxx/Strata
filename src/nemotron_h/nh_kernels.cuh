@@ -166,6 +166,17 @@ __global__ void k_scale(float* x, float s, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] *= s;
 }
+/// Same per-lane multiply as k_scale, four floats at a time.  Prompt outputs only (n4 = n/4, 16-byte aligned).
+__global__ void k_scale4(float* x, float s, int64_t n4) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n4) return;
+    float4 v = reinterpret_cast<float4*>(x)[i];
+    v.x *= s;
+    v.y *= s;
+    v.z *= s;
+    v.w *= s;
+    reinterpret_cast<float4*>(x)[i] = v;
+}
 /// x = relu(x)^2 in place (the shared expert's hidden).
 __global__ void k_relu2(float* x, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -209,6 +220,52 @@ __global__ void __launch_bounds__(128) k_conv(float* hist, const float* in, int 
     hist[c * 3] = v0;
     hist[c * 3 + 1] = v1;
     hist[c * 3 + 2] = v2;
+}
+
+/// Prompt conv (T > 64): the same 4-tap SiLU as k_conv, but one tile of TILE tokens per block so the grid fills the
+/// GPU.  Tile 0 starts from `hist`; later tiles read the three inputs before the tile (the window is raw inputs).
+/// History is not stored here — k_conv_save_hist does that when the caller wants it.  Decode stays on k_conv.
+template <int TILE>
+__global__ void __launch_bounds__(128) k_conv_prompt(const float* hist, const float* in, int ld, const float* w,
+                                                    const float* bias, float* out, int C, int T) {
+    const int c = blockIdx.x * 128 + threadIdx.x;
+    if (c >= C) return;
+    const int t0 = (int) blockIdx.y * TILE;
+    if (t0 >= T) return;
+    const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+    const float b = bias ? bias[c] : 0.f;
+    float xm3, xm2, xm1;
+    if (t0 == 0) {
+        xm3 = hist[c * 3];
+        xm2 = hist[c * 3 + 1];
+        xm1 = hist[c * 3 + 2];
+    } else {
+        xm3 = in[(size_t) (t0 - 3) * ld + c];
+        xm2 = in[(size_t) (t0 - 2) * ld + c];
+        xm1 = in[(size_t) (t0 - 1) * ld + c];
+    }
+    const int t1 = t0 + TILE < T ? t0 + TILE : T;
+    for (int t = t0; t < t1; ++t) {
+        const float x = in[(size_t) t * ld + c];
+        float sum = 0.f;
+        sum += xm3 * w0;
+        sum += xm2 * w1;
+        sum += xm1 * w2;
+        sum += x * w3;
+        xm3 = xm2;
+        xm2 = xm1;
+        xm1 = x;
+        const float y = sum + b;
+        out[(size_t) t * C + c] = y / (1.0f + expf(-y));
+    }
+}
+/// Last three conv inputs into the history, matching k_conv's write when T >= 3.
+__global__ void __launch_bounds__(128) k_conv_save_hist(float* hist, const float* in, int ld, int C, int T) {
+    const int c = blockIdx.x * 128 + threadIdx.x;
+    if (c >= C || T < 3) return;
+    hist[c * 3] = in[(size_t) (T - 3) * ld + c];
+    hist[c * 3 + 1] = in[(size_t) (T - 2) * ld + c];
+    hist[c * 3 + 2] = in[(size_t) (T - 1) * ld + c];
 }
 
 /// The Mamba-2 selective scan over T tokens (ggml_ssm_scan, scalar A per head): per head h, dt = softplus(dt_raw +

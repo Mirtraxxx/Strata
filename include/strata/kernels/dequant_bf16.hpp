@@ -33,4 +33,8 @@ void dequant_f32(int ggml_type, const void* blocks, int64_t row0, int64_t rows, 
 /// default (STRATA_DEQUANT_WIDE, else on for compute capability 6.1).  For dequant_wide_parity.
 void dequant_set_wide(int mode);
 
+/// NVFP4 (type 40) vector dequant, bitwise the same as the scalar kernel: 0 off, 1 on, -1 the default (on;
+/// STRATA_NVFP4_VEC=0 / =1 overrides).  Other types are unchanged.  For dequant_wide_parity.
+void dequant_set_nvfp4_vec(int mode);
+
 }  // namespace strata::kernels

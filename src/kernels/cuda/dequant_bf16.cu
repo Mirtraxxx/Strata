@@ -282,8 +282,54 @@ __global__ void dequant_wide_kernel(const uint8_t* __restrict__ blocks, int64_t 
 #pragma unroll
     for (int k = 0; k < (int) (8 * sizeof(T) / 16); ++k) o[k] = ((const uint4*) v)[k];
 }
+// NVFP4 (type 40): one thread per 16-value sub-block, the same arithmetic as group32<40>.  A 64-value block is 36 bytes
+// (4 scales, then 4 sub-blocks of 8 code bytes).  Consecutive threads write consecutive 16-value chunks, so a warp's
+// FP16 stores are one contiguous run.  Scalar dequant_kernel<40> stays the fallback (STRATA_NVFP4_VEC=0, or an
+// unaligned pointer).  Other GGUF types do not take this kernel.
+template <typename T>
+__global__ void dequant_nvfp4_kernel(const uint8_t* __restrict__ blocks, int64_t row_bytes, int64_t row0, int64_t rows,
+                                     int64_t blocks_per_row, int64_t ld, T* __restrict__ out) {
+    const int64_t nsub = rows * blocks_per_row * 4;
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nsub) return;
+    const int64_t blk = i >> 2;
+    const int s = (int) (i & 3);
+    const int64_t r = blk / blocks_per_row;
+    const int64_t bi = blk - r * blocks_per_row;
+    const uint8_t* b = blocks + (row0 + r) * row_bytes + bi * 36;
+    const float d = ue4m3_to_f32_half(b[s]);
+    const uint32_t q0 = *reinterpret_cast<const uint32_t*>(b + 4 + 8 * s);
+    const uint32_t q1 = *reinterpret_cast<const uint32_t*>(b + 8 + 8 * s);
+    __align__(16) T tmp[16];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int byte = (int) ((q0 >> (8 * j)) & 0xFFu);
+        put(tmp, j, (float) kv_fp4[byte & 0x0F] * d);
+        put(tmp, 8 + j, (float) kv_fp4[byte >> 4] * d);
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int byte = (int) ((q1 >> (8 * j)) & 0xFFu);
+        put(tmp, 4 + j, (float) kv_fp4[byte & 0x0F] * d);
+        put(tmp, 12 + j, (float) kv_fp4[byte >> 4] * d);
+    }
+    uint4* o = reinterpret_cast<uint4*>(out + r * ld + bi * 64 + (int64_t) s * 16);
+#pragma unroll
+    for (int k = 0; k < (int) (16 * sizeof(T) / 16); ++k) o[k] = reinterpret_cast<const uint4*>(tmp)[k];
+}
+
 bool wide_type(int type) { return type == 12 || type == 13 || type == 14 || type == 23; }
 int g_dequant_wide = -1;   // dequant_set_wide (the parity test); -1 = STRATA_DEQUANT_WIDE, else the card's default
+int g_nvfp4_vec = -1;      // dequant_set_nvfp4_vec; -1 = STRATA_NVFP4_VEC, else on
+bool nvfp4_vec_on() {
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_NVFP4_VEC");
+        return v != nullptr && v[0] != '\0' ? (std::atoi(v) != 0 ? 1 : 0) : -1;
+    }();
+    if (g_nvfp4_vec >= 0) return g_nvfp4_vec != 0;
+    if (env >= 0) return env != 0;
+    return true;
+}
 bool dequant_wide_on() {
     static const int env = [] { const char* v = std::getenv("STRATA_DEQUANT_WIDE"); return v != nullptr && v[0] != '\0' ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
     if (g_dequant_wide >= 0) return g_dequant_wide != 0;
@@ -379,6 +425,17 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
         if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
         return;
     }
+    // type 40 only.  16-byte stores: the block base is 4-aligned (36-byte blocks) and each 16-value chunk is a
+    // whole number of uint4s.  A miss falls through to dequant_kernel<40>.
+    if (type == 40 && nvfp4_vec_on() && (reinterpret_cast<uintptr_t>(blocks) % 4) == 0 &&
+        (reinterpret_cast<uintptr_t>(out) % 16) == 0 && ((size_t) ld * sizeof(T)) % 16 == 0 && row_bytes % 4 == 0) {
+        const int64_t nsub = rows * (cols / 64) * 4;
+        const unsigned ngrid = (unsigned) ((nsub + 255) / 256);
+        dequant_nvfp4_kernel<T><<<ngrid, 256, 0, st>>>(p, row_bytes, row0, rows, cols / 64, ld, out);
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
+        return;
+    }
 #define STRATA_DQ(TY) dequant_kernel<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, ld, out); break
     switch (type) {
     case 2: STRATA_DQ(2);
@@ -402,6 +459,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
 }  // namespace
 
 void dequant_set_wide(int mode) { g_dequant_wide = mode; }
+void dequant_set_nvfp4_vec(int mode) { g_nvfp4_vec = mode; }
 
 bool dequant_bf16_supported(int ggml_type) noexcept {
     int a, b;
