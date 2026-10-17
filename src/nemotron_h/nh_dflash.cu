@@ -1066,6 +1066,10 @@ struct DFlashDrafter::Impl {
     };
     std::vector<LayerKVCache> kv_caches;
     int kv_len = 0; // current valid tokens in KV cache
+    // tokens injected since reset(): the ring slot of the next one is n_injected % sliding_window, so a sequence that
+    // starts (or restarts) at any position fills slots 0, 1, ... and the attention reads exactly the kv_len valid ones
+    int64_t n_injected = 0;
+    const half* enc_f16_input = nullptr;   // encode_and_inject_f16's input for the shared encode path
     float* d_anchor_state = nullptr; // [4096] anchor context features from last prompt position
 
     // Workspace device memory
@@ -1228,6 +1232,37 @@ void DFlashDrafter::set_target_weights(const void* d_token_embd_q8, const void* 
 
 void DFlashDrafter::reset() {
     impl_->kv_len = 0;
+    impl_->n_injected = 0;
+}
+
+size_t DFlashDrafter::state_bytes() const {
+    const auto& c = impl_->cfg;
+    return (size_t) c.n_layers * 2 * c.sliding_window * c.n_head_kv * c.head_dim * sizeof(half) + c.n_embd * sizeof(float) +
+           2 * sizeof(int64_t);
+}
+
+void DFlashDrafter::copy_state(void* host, bool save, cudaStream_t stream) {
+    auto& m = *impl_;
+    if (!stream) stream = m.default_stream;
+    const size_t kvb = (size_t) m.cfg.sliding_window * m.cfg.n_head_kv * m.cfg.head_dim * sizeof(half);
+    uint8_t* h = static_cast<uint8_t*>(host);
+    const auto kind = save ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice;
+    for (auto& c : m.kv_caches) {
+        CUDA_CHECK(save ? cudaMemcpyAsync(h, c.k_cache, kvb, kind, stream) : cudaMemcpyAsync(c.k_cache, h, kvb, kind, stream));
+        CUDA_CHECK(save ? cudaMemcpyAsync(h + kvb, c.v_cache, kvb, kind, stream) : cudaMemcpyAsync(c.v_cache, h + kvb, kvb, kind, stream));
+        h += 2 * kvb;
+    }
+    const size_t ab = (size_t) m.cfg.n_embd * sizeof(float);
+    CUDA_CHECK(save ? cudaMemcpyAsync(h, m.d_anchor_state, ab, kind, stream) : cudaMemcpyAsync(m.d_anchor_state, h, ab, kind, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    int64_t* tail = reinterpret_cast<int64_t*>(h + ab);
+    if (save) {
+        tail[0] = m.kv_len;
+        tail[1] = m.n_injected;
+    } else {
+        m.kv_len = (int) tail[0];
+        m.n_injected = tail[1];
+    }
 }
 
 bool DFlashDrafter::load(const std::string& dflash_gguf_path,
@@ -1479,6 +1514,12 @@ bool DFlashDrafter::load(const std::string& dflash_gguf_path,
     }
 }
 
+void DFlashDrafter::encode_and_inject_f16(const __half* d_target_features, int n_tokens, int pos0, cudaStream_t stream) {
+    impl_->enc_f16_input = d_target_features;
+    encode_and_inject(nullptr, n_tokens, pos0, stream);
+    impl_->enc_f16_input = nullptr;
+}
+
 void DFlashDrafter::encode_and_inject(const float* d_target_features,
                                      int n_tokens,
                                      int pos0,
@@ -1488,7 +1529,7 @@ void DFlashDrafter::encode_and_inject(const float* d_target_features,
     cublasSetStream(m.cublas, stream);
 
     size_t needed_inp = (size_t) n_tokens * m.cfg.n_embd_inp;
-    if (needed_inp > m.enc_inp_half_cap) {
+    if (!m.enc_f16_input && needed_inp > m.enc_inp_half_cap) {
         if (m.d_enc_inp_half) cudaFree(m.d_enc_inp_half);
         CUDA_CHECK(cudaMalloc(&m.d_enc_inp_half, needed_inp * sizeof(half)));
         m.enc_inp_half_cap = needed_inp;
@@ -1502,11 +1543,14 @@ void DFlashDrafter::encode_and_inject(const float* d_target_features,
         m.enc_fc_out_cap = needed_fc;
     }
 
-    // 1. Convert input features [n_tokens, 24576] from float to half
-    half* d_inp_half = m.d_enc_inp_half;
-    int b = 256;
-    int g = (int) ((needed_inp + b - 1) / b);
-    convert_f32_to_half_kernel<<<g, b, 0, stream>>>(d_target_features, d_inp_half, needed_inp);
+    // 1. Convert input features [n_tokens, 24576] from float to half (unless they come as FP16 already)
+    const half* d_inp_half = m.enc_f16_input;
+    if (!d_inp_half) {
+        int b = 256;
+        int g = (int) ((needed_inp + b - 1) / b);
+        convert_f32_to_half_kernel<<<g, b, 0, stream>>>(d_target_features, m.d_enc_inp_half, needed_inp);
+        d_inp_half = m.d_enc_inp_half;
+    }
 
     // 2. Encoder projection: fc(inp_target) -> [4096, n_tokens] (FP32)
     float* d_fc_out = m.d_enc_fc_out;
@@ -1563,15 +1607,22 @@ void DFlashDrafter::encode_and_inject(const float* d_target_features,
         int rope_blocks = (rope_threads + 255) / 256;
         neox_rope_kernel<<<rope_blocks, 256, 0, stream>>>(nullptr, d_k_proj, 0, m.cfg.n_head_kv, m.cfg.head_dim, pos0, n_tokens, m.cfg.rope_freq_base);
 
-        // Copy K and V into circular/linear cache
-        for (int t = 0; t < n_tokens; ++t) {
-            int slot = (pos0 + t) % m.cfg.sliding_window;
-            CUDA_CHECK(cudaMemcpyAsync(c.k_cache + slot * kv_dim, d_k_proj + t * kv_dim, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(c.v_cache + slot * kv_dim, d_v_proj + t * kv_dim, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream));
+        // Into the ring, in at most two contiguous runs (only the last sliding_window tokens of a long chunk matter)
+        const int W = m.cfg.sliding_window;
+        const int skip = std::max(0, n_tokens - W);
+        int t = skip;
+        int slot = (int) ((m.n_injected + skip) % W);
+        while (t < n_tokens) {
+            const int run = std::min(n_tokens - t, W - slot);
+            CUDA_CHECK(cudaMemcpyAsync(c.k_cache + (size_t) slot * kv_dim, d_k_proj + (size_t) t * kv_dim, (size_t) run * kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(c.v_cache + (size_t) slot * kv_dim, d_v_proj + (size_t) t * kv_dim, (size_t) run * kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream));
+            t += run;
+            slot = (slot + run) % W;
         }
     }
 
-    m.kv_len = std::min(m.cfg.sliding_window, pos0 + n_tokens);
+    m.n_injected += n_tokens;
+    m.kv_len = (int) std::min<int64_t>(m.cfg.sliding_window, m.n_injected);
 }
 
 std::vector<int32_t> DFlashDrafter::draft(int32_t id_last,

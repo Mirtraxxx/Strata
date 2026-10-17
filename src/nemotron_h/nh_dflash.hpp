@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 namespace strata::nemotron_h {
@@ -57,6 +58,11 @@ public:
     // Reset KV cache and state for a new sequence
     void reset();
 
+    // The sequence state (KV ring, anchor, fill counters) to/from host memory of state_bytes(): a turn checkpoint
+    // keeps it beside the target's Mamba state, so a restored checkpoint drafts with its full context again
+    size_t state_bytes() const;
+    void copy_state(void* host, bool save, cudaStream_t stream = nullptr);
+
     // Encode target layer hidden states and inject into DFlash KV cache:
     // d_target_features: device pointer to [n_tokens, 24576] float32 array
     // pos0: starting position in sequence
@@ -64,6 +70,12 @@ public:
                           int n_tokens,
                           int pos0,
                           cudaStream_t stream = nullptr);
+
+    // The same from FP16 features [n_tokens, 24576] (the encoder reads FP16 either way)
+    void encode_and_inject_f16(const __half* d_target_features,
+                               int n_tokens,
+                               int pos0,
+                               cudaStream_t stream = nullptr);
 
     // Draft a block of tokens:
     // id_last: last committed/sampled token id

@@ -16,6 +16,8 @@
 //     VRAM buffers (a copy thread feeding a copy stream) into grouped IQ MMQ (the weights stay quantized);
 //   * the GGUF's MTP block (blk.88: eh_proj over [enorm(e) | hnorm(h)], attention, MoE, the LayerNorm head norm)
 //     drafts for greedy requests (--mtp N), verified by the main model (the Mamba state is committed afterwards);
+//   * or DFlash (--dflash GGUF, Bolt): the LiLiCorr block drafter (nh_dflash) reads the residual entering 6 target
+//     sublayers and drafts up to 7 tokens a step, verified the same way;
 //   * images (GENI): strata-vision's rows (llama.cpp mtmd, the mmproj's RADIO tower + projector) in place of the
 //     prompt's <image> tokens (the server writes <img> <image> x n </img>).
 //
@@ -32,6 +34,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #endif
 
+#include "nh_dflash.hpp"
 #include "nh_kernels.cuh"
 #include "nh_ssm_scan.cuh"
 
@@ -634,6 +637,13 @@ template <class T> T* dalloc_t(size_t n) {
     return p;
 }
 
+/// DFlash's target features: rows of the residual into their column block of the [rows, ld] FP16 matrix
+__global__ void k_feat16(const float* __restrict__ x, int N, __half* __restrict__ dst, int ld) {
+    const float* r = x + (size_t) blockIdx.x * N;
+    __half* d = dst + (size_t) blockIdx.x * ld;
+    for (int i = threadIdx.x; i < N; i += blockDim.x) d[i] = __float2half(r[i]);
+}
+
 struct Engine {
     const Model* m = nullptr;
     cudaStream_t st = nullptr;
@@ -666,6 +676,15 @@ struct Engine {
     float* sk_part = nullptr;
     int mtp_d = 0;
     bool prompt_mtp = true;   // the prompt also runs through the MTP block (its KV) when drafts are on
+    // ---- DFlash (--dflash GGUF): the drafter reads the residual entering its target sublayers, FP16, the last
+    // kFeatRows rows of a forward (its KV ring holds no more), and drafts df_d tokens a step
+    std::unique_ptr<strata::nemotron_h::DFlashDrafter> df;
+    int df_d = 0, df_ntgt = 0;
+    std::vector<int> df_col;   // per sublayer: its column block in feat16 (-1: not a target)
+    __half* feat16 = nullptr;
+    static constexpr int kFeatRows = 1024;
+    double df_ms = 0;          // drafting time (the drafter's own clock), summed
+    long long df_steps = 0;
     // the hybrid mode
     struct Hy {
         std::vector<int> slot_of, exp_in_slot;
@@ -705,6 +724,7 @@ struct Engine {
         int64_t pos = 0;           // the tokens it holds: live[0 .. pos)
         float* host = nullptr;
         uint64_t used = 0;
+        std::vector<uint8_t> df_state;   // the DFlash drafter's KV ring and anchor at pos
     };
     std::vector<Ckpt> ckpts;
     int max_ckpts = 4;
@@ -753,6 +773,10 @@ struct Engine {
         c->pos = pos;
         c->used = ++ckpt_clock;
         ckpt_copy(c->host, true);
+        if (df) {
+            c->df_state.resize(df->state_bytes());
+            df->copy_state(c->df_state.data(), true, st);
+        }
     }
     /// The checkpoints past `keep` tokens no longer describe the live sequence (its cells were rewritten from there).
     void ckpt_drop_past(int64_t keep) {
@@ -764,6 +788,10 @@ struct Engine {
         for (Ckpt& k : ckpts) if (k.pos > 0 && k.pos <= limit && (!best || k.pos > best->pos)) best = &k;
         if (!best) return 0;
         ckpt_copy(best->host, false);
+        if (df) {
+            if (best->df_state.size() == df->state_bytes()) df->copy_state(best->df_state.data(), false, st);
+            else df->reset();
+        }
         best->used = ++ckpt_clock;
         pos = best->pos;
         return pos;
@@ -1014,6 +1042,7 @@ struct Engine {
         CK(cudaMemsetAsync(hlast, 0, (size_t) g.N * 4, st));
         CK(cudaStreamSynchronize(st));
         pos = 0;
+        if (df) df->reset();
     }
 
     // ---- matmuls: a decode batch on the native MMVQ (q8_1 activations), a prompt chunk on FP16 GEMMs
@@ -1564,6 +1593,10 @@ struct Engine {
         for (size_t l = 0; l < m->layers.size(); ++l) {
             const Layer& L = m->layers[l];
             const bool last = l + 1 == m->layers.size();
+            if (feat16 && df_col[l] >= 0) {
+                const int R = std::min(T, kFeatRows);
+                k_feat16<<<R, 256, 0, st>>>(x + (size_t) (T - R) * N, N, feat16 + (size_t) df_col[l] * N, df_ntgt * N);
+            }
             const float* wn = last ? m->out_norm : m->layers[l + 1].norm;
             float* hout = last ? hmain : h;
             // the prefetch: the next sublayer is a MoE block in the rows path -> guess its experts now, upload them while
@@ -1693,6 +1726,10 @@ struct Engine {
             CK(cudaMemcpyAsync(tok, toks + i, (size_t) T * 4, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
             forward(T, pos, i + T == n ? 1 : 0, false);
+            if (df) {
+                const int R = std::min(T, kFeatRows);
+                df->encode_and_inject_f16(feat16, R, (int) (pos + T - R), st);
+            }
             if (m->has_mtp && mtp_d > 0 && prompt_mtp) {
                 CK(cudaMemcpyAsync(seeds, hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
                 if (T > 1) CK(cudaMemcpyAsync(seeds + N, hmain, (size_t) (T - 1) * N * 4, cudaMemcpyDeviceToDevice, st));
@@ -1765,6 +1802,69 @@ struct Engine {
         return a;
     }
 
+    /// One DFlash step: the drafter's block from `x_tok` (decided, not processed) at pos, D of its drafts verified
+    /// in one window of D + 1 rows; the kept rows' features go into the drafter.  Returns the accepted count a;
+    /// picks[0 .. a] are the window's picks.
+    int dflash_step(int x_tok, int D, std::vector<int32_t>& drafts, int32_t* picks) {
+        const int N = m->g.N;
+        CK(cudaStreamSynchronize(st));
+        const std::vector<int32_t> blk = df->draft(x_tok, (int32_t) pos, nullptr, st);
+        df_ms += df->last_draft_ms();
+        ++df_steps;
+        drafts.assign(blk.begin(), blk.begin() + D);
+        const int T = D + 1;
+        hpin[16] = x_tok;
+        for (int d = 0; d < D; ++d) hpin[17 + d] = drafts[(size_t) d];
+        hpin[1] = (int32_t) pos;
+        CK(cudaMemcpyAsync(tok, hpin + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
+        forward(T, pos, T, true);
+        CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+        int a = 0;
+        while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+        for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        commit(a + 1);
+        df->encode_and_inject_f16(feat16, a + 1, (int) pos, st);
+        CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
+        const int64_t before = pos;
+        pos += a + 1;
+        if (before / adapt_every != pos / adapt_every) rebalance(adapt_swaps);
+        return a;
+    }
+    /// The drafts a speculative step offers (DFlash's, else the MTP block's; 0: no speculation)
+    int spec_d() const { return df ? df_d : mtp_d; }
+    int spec_any(int x_tok, std::vector<int32_t>& fix, std::vector<int32_t>& drafts, int32_t* picks) {
+        if (df) return dflash_step(x_tok, df_d, drafts, picks);
+        return spec_step(x_tok, fix, mtp_d, drafts, picks);
+    }
+    /// The drafter on the GPU before the expert slots are sized: its weights (FP16), the shared embedding and head
+    /// (the engine's own Q8_0 copies), the feature buffer, and one inject + draft so its lazy buffers exist too.
+    bool load_dflash(const std::string& path, int d, std::string& err) {
+        const Geo& g = m->g;
+        if (m->embd_type != 8 || m->head.type != 8) { err = "DFlash needs the target's token_embd and output in Q8_0"; return false; }
+        df = std::make_unique<strata::nemotron_h::DFlashDrafter>();
+        if (!df->load(path, "", err)) return false;
+        df->set_target_weights(m->embd, m->head.d, g.V);
+        const auto& cfg = df->config();
+        if (cfg.n_embd != g.N) { err = "the DFlash GGUF's width is not the model's"; return false; }
+        df_ntgt = (int) cfg.target_layers.size();
+        df_col.assign(m->layers.size(), -1);
+        for (int k = 0; k < df_ntgt; ++k) {
+            const int l = cfg.target_layers[(size_t) k];
+            if (l < 0 || l >= (int) m->layers.size()) { err = "a DFlash target layer past the model's"; return false; }
+            df_col[(size_t) l] = k;
+        }
+        df_d = std::max(1, std::min(d, cfg.n_draft));
+        feat16 = dalloc_t<__half>((size_t) kFeatRows * df_ntgt * g.N);
+        CK(cudaMemsetAsync(feat16, 0, (size_t) kFeatRows * df_ntgt * g.N * 2, st));
+        df->encode_and_inject_f16(feat16, std::min(tmax, kFeatRows), 0, st);
+        (void) df->draft(0, std::min(tmax, kFeatRows), nullptr, st);
+        df->reset();
+        CK(cudaStreamSynchronize(st));
+        return true;
+    }
+
     void warmup() {
         const auto t0 = Clock::now();
         warming = true;
@@ -1773,10 +1873,10 @@ struct Engine {
         std::vector<int32_t> toks((size_t) std::min(hybrid_t, kVerify), filler);
         process(toks.data(), (int64_t) toks.size(), [](int64_t) {});
         process(&filler, 1, [](int64_t) {});
-        if (mtp_d > 0) {
+        if (spec_d() > 0) {
             std::vector<int32_t> fix, drafts;
             int32_t picks[16];
-            spec_step(filler, fix, mtp_d, drafts, picks);
+            spec_any(filler, fix, drafts, picks);
         }
         CK(cudaStreamSynchronize(st));
         warming = false;
@@ -2512,7 +2612,7 @@ int serve(Engine& E) {
         const auto d0 = Clock::now();
         long long produced = 0, offered = 0, accepted = 0;
         const char* finish = "length";
-        const bool spec = E.mtp_d > 0 && !smp.needs_logits();
+        const bool spec = E.spec_d() > 0 && !smp.needs_logits();
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
         int nx = smp.needs_logits() ? -1 : E.greedy();
@@ -2533,9 +2633,9 @@ int serve(Engine& E) {
                 return true;
             };
             if (!emit(nx)) break;
-            if (spec && E.pos + E.mtp_d + 1 <= E.ctx) {
-                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks);
-                offered += E.mtp_d;
+            if (spec && E.pos + E.spec_d() + 1 <= E.ctx) {
+                const int a = E.spec_any(nx, fix, drafts, picks);
+                offered += E.spec_d();
                 accepted += a;
                 live.push_back(nx);
                 fix.assign(drafts.begin(), drafts.begin() + a);
@@ -2568,6 +2668,8 @@ int serve(Engine& E) {
 int strata::nemotron_h::run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, dump_layers;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 64;
+    std::string dflash;
+    int dflash_d = 7;
     // the PCIe share and the prefetch are off by default: measured on the RTX 3090 + i7-7800X (DDR4-2133, quad
     // channel) the CPU experts already read RAM at its ceiling (~40 GB/s), and the uploads read the same RAM
     // (docs/NEMOTRON_H.md); a faster PCIe link or a slower CPU is where they pay
@@ -2606,6 +2708,8 @@ int strata::nemotron_h::run(int argc, char** argv) {
             else std::fprintf(stderr, "strata-nh: ignoring --mtp %s (this family's MTP is the GGUF's own block: --mtp N drafts)\n",
                               v.c_str());
         }
+        else if (a == "--dflash") dflash = next();
+        else if (a == "--dflash-d") dflash_d = std::atoi(next().c_str());
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
@@ -2631,6 +2735,7 @@ int strata::nemotron_h::run(int argc, char** argv) {
         } else {
             std::fprintf(stderr,
                          "usage: strata-nh --model GGUF [--max-context 32768] [--chunk 1024] [--mtp N] [--expert-vram GiB]\n"
+                         "       [--dflash GGUF] [--dflash-d 7]\n"
                          "       [--expert-slots N] [--hybrid-rows 64] [--cpu-threads N] [--stream-ring 64] [--pin-experts]\n"
                          "       [--vram-reserve-mib 1024] [--pcie-frac 0] [--pcie-max 48] [--prefetch 0] [--no-arena]\n"
                          "       [--expert-profile F] [--expert-profile-save F] [--adapt-every 32] [--adapt-swaps 8]\n"
@@ -2670,6 +2775,15 @@ int strata::nemotron_h::run(int argc, char** argv) {
     (void) pin;
     E.init(m, ctx, chunk, ring);
     E.prompt_chunk = chunk;
+    if (!dflash.empty()) {
+        try {
+            if (!E.load_dflash(dflash, dflash_d, err)) { std::fprintf(stderr, "strata-nh: --dflash: %s\n", err.c_str()); return 1; }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata-nh: --dflash: %s\n", e.what());
+            return 1;
+        }
+        std::fprintf(stderr, "strata-nh: DFlash drafter %s, %d drafts a step\n", dflash.c_str(), E.df_d);
+    }
     if (!place_experts(m, E, expert_vram, cpu_threads, expert_slots, ring, arena, reserve_mib, profile, err)) {
         std::fprintf(stderr, "strata-nh: %s\n", err.c_str());
         return 1;
@@ -2727,7 +2841,7 @@ int strata::nemotron_h::run(int argc, char** argv) {
     E.process(prompt.data(), (int64_t) prompt.size(), [](int64_t) {});
     const double pp_ms = ms_since(t0);
     const auto t1 = Clock::now();
-    if (E.mtp_d > 0 && forced.empty() && !ff) {
+    if (E.spec_d() > 0 && forced.empty() && !ff) {
         long long offered = 0, accepted = 0;
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
@@ -2735,8 +2849,8 @@ int strata::nemotron_h::run(int argc, char** argv) {
         while ((int) gen.size() < n_gen) {
             gen.push_back(nx);
             if ((int) gen.size() >= n_gen) break;
-            const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks);
-            offered += E.mtp_d;
+            const int a = E.spec_any(nx, fix, drafts, picks);
+            offered += E.spec_d();
             accepted += a;
             fix.assign(drafts.begin(), drafts.begin() + a);
             for (int i = 0; i < a && (int) gen.size() < n_gen; ++i) gen.push_back(drafts[(size_t) i]);
@@ -2746,9 +2860,13 @@ int strata::nemotron_h::run(int argc, char** argv) {
         std::printf("gen:");
         for (int t : gen) std::printf(" %d", t);
         std::printf("\n");
-        std::fprintf(stderr, "strata-nh: prompt %zu tokens in %.1f ms, %zu generated in %.1f ms (%.2f tok/s), MTP %d drafts: "
-                     "%lld of %lld accepted (%.0f%%)\n", prompt.size(), pp_ms, gen.size(), ms_since(t1),
-                     gen.size() / (ms_since(t1) / 1000.0), E.mtp_d, accepted, offered, offered ? 100.0 * accepted / offered : 0.0);
+        std::fprintf(stderr, "strata-nh: prompt %zu tokens in %.1f ms, %zu generated in %.1f ms (%.2f tok/s), %s %d drafts: "
+                     "%lld of %lld accepted (%.0f%%, %.2f tokens a step)\n", prompt.size(), pp_ms, gen.size(), ms_since(t1),
+                     gen.size() / (ms_since(t1) / 1000.0), E.df ? "DFlash" : "MTP", E.spec_d(), accepted, offered,
+                     offered ? 100.0 * accepted / offered : 0.0, offered ? 1.0 + (double) accepted * E.spec_d() / offered : 0.0);
+        if (E.df)
+            std::fprintf(stderr, "strata-nh: DFlash drafting %.2f ms a step (%lld steps)\n", E.df_steps ? E.df_ms / E.df_steps : 0.0,
+                         E.df_steps);
         return 0;
     }
     for (int i = 0; i < n_gen; ++i) {

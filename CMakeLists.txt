@@ -661,7 +661,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(nh_ssm_scan_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
     add_library(strata_nemotron_h STATIC src/nemotron_h/nh_engine.cu src/nemotron_h/nh_ssm_scan.cu)
     target_include_directories(strata_nemotron_h PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_strata_gpu_include_directories})
-    target_link_libraries(strata_nemotron_h PRIVATE strata_prefill strata_kernels strata_nemotron_h_cpu strata_warnings
+    target_link_libraries(strata_nemotron_h PRIVATE strata_prefill strata_kernels strata_nemotron_h_cpu strata_nh_dflash strata_warnings
                           ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
     add_executable(strata-nh src/nemotron_h/nh_main.cpp)
     target_link_libraries(strata-nh PRIVATE strata_nemotron_h ${_strata_gpu_runtime_target})
