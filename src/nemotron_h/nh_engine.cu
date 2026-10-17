@@ -29,6 +29,7 @@
 #include "strata/prefill/gemm.hpp"
 
 #include "nh_kernels.cuh"
+#include "nh_ssm_scan.cuh"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -652,6 +653,7 @@ struct Engine {
     std::vector<__half*> kc, vc;         // per attention layer (+ the MTP block's at n_attn)
     strata::prefill::Gemm gemm;
     cublasHandle_t blas = nullptr;
+    SsmWs ssm_ws;
     static constexpr int kSplitK = 16;
     float* sk_part = nullptr;
     int mtp_d = 0;
@@ -959,6 +961,7 @@ struct Engine {
         ecpu = dalloc(T * Kp * g.LAT);
         d_miss = dalloc_t<int32_t>(T * Kp);
         init_transient();
+        if (tmax > kSsmSsdMinTok) ssm_ws_reserve(ssm_ws, g.ssm_H, kSsmP, kSsmN, g.ssm_G, tmax);   // the prompt scan's scratch
         CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming | cudaEventBlockingSync));
         CK(cudaDeviceSynchronize());
         size_t fr = 0, tot = 0;
@@ -1030,8 +1033,8 @@ struct Engine {
                                  (size_t) vcols * 4, (size_t) T, cudaMemcpyDeviceToDevice, st));
         k_conv<<<grid1(g.conv_ch, 128), 128, 0, st>>>(conv[(size_t) li], zx + g.ssm_inner, g.in_proj, L.conv_w, L.conv_b, xc,
                                                       g.conv_ch, T, !verify);
-        k_ssm<<<g.ssm_H, 256, 0, st>>>(S[(size_t) li], xc, g.conv_ch, zx + g.ssm_inner + g.conv_ch, g.in_proj, L.dt_b, L.A,
-                                       L.D, yr, g.ssm_H, g.ssm_G, T, !verify);
+        ssm_scan(S[(size_t) li], xc, g.conv_ch, zx + g.ssm_inner + g.conv_ch, g.in_proj, L.dt_b, L.A, L.D, yr, g.ssm_H,
+                 g.ssm_G, kSsmP, kSsmN, T, !verify, ssm_ws, st, blas);
         k_gate_norm<<<dim3(g.ssm_G, T), kThreads, 0, st>>>(yr, zx, g.in_proj, L.ssm_norm, yg, g.ssm_inner,
                                                            g.ssm_inner / g.ssm_G, g.eps);
         mm(L.ssm_out, yg, y, T);
