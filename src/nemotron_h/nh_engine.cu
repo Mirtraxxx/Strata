@@ -90,11 +90,13 @@ struct Mat {
     const uint8_t* d = nullptr;   // device, GGUF blocks
     int type = -1;
     int n_in = 0, n_out = 0;
+    float scale = 1.0f;           // companion .scale tensor (NVFP4), 1.0 when absent
 };
 
 enum class Kind { Mamba, Attn, Moe };
 
 struct Moe {
+    int E = 0, FF = 0;                                 // routed expert count and width of this layer
     const float *router = nullptr, *bias = nullptr;   // [E][N] f32, [E]
     Mat lat_down, lat_up, sh_up, sh_down;
     K::NativeExpertLayout L;                           // [up | down] blobs (ungated)
@@ -213,7 +215,13 @@ bool load(const std::string& path, Model& m, std::string& err) {
     const std::string p = "nemotron_h_moe.";
     auto num = [&](const std::string& k, double dflt) {
         const strata::MetaValue* v = meta(gm, p + k);
-        return v ? v->num() : dflt;
+        if (!v) return dflt;
+        if (v->type == strata::MetaType::ARRAY) {
+            double mx = 0;
+            for (const strata::MetaValue& it : v->items) mx = std::max(mx, it.num());
+            return mx > 0 ? mx : dflt;
+        }
+        return v->num();
     };
     Geo& g = m.g;
     g.n_all = (int) num("block_count", 0);
@@ -222,9 +230,9 @@ bool load(const std::string& path, Model& m, std::string& err) {
     g.N = (int) num("embedding_length", 0);
     g.V = (int) num("vocab_size", 0);
     g.H = (int) num("attention.head_count", 0);
-    g.E = (int) num("expert_count", 0);
+    g.E = 0;
     g.top_k = (int) num("expert_used_count", 0);
-    g.FF = (int) num("expert_feed_forward_length", 0);
+    g.FF = 0;
     g.FS = (int) num("expert_shared_feed_forward_length", 0);
     g.LAT = (int) num("moe_latent_size", 0);
     g.w_norm = num("expert_weights_norm", 1) != 0;
@@ -243,8 +251,8 @@ bool load(const std::string& path, Model& m, std::string& err) {
         if (const strata::TensorInfo* t = gm.find("token_embd.weight")) g.V = (int) t->shape[1];
     }
     if (g.n_layers <= 0 || g.N % 256 || key_len != kHD || g.ssm_conv != 4 || g.ssm_N != kSsmN ||
-        g.ssm_inner / g.ssm_H != kSsmP || g.ssm_H % g.ssm_G || g.E > 512 || g.top_k > kMaxTopK || g.top_k < 1 ||
-        g.LAT % 256 || g.FF % 32 || g.FS % 256 || g.ssm_inner % g.ssm_G) {
+        g.ssm_inner / g.ssm_H != kSsmP || g.ssm_H % g.ssm_G || g.top_k > kMaxTopK || g.top_k < 1 ||
+        g.LAT % 256 || g.FS % 256 || g.ssm_inner % g.ssm_G) {
         err = "a geometry this driver's kernels do not take (head 128, conv 4, state 128, head_dim 64, <= 512 experts, "
               "top-k <= 32, widths in whole blocks)";
         return false;
@@ -284,6 +292,13 @@ bool load(const std::string& path, Model& m, std::string& err) {
         CK(cudaMemcpy(d, gm.shard(s).tensor_data(*t), nb, cudaMemcpyHostToDevice));
         bytes += nb;
         w.d = d;
+        if (name.size() > 7 && name.compare(name.size() - 7, 7, ".weight") == 0) {
+            size_t ss = 0;
+            if (const strata::TensorInfo* ts = gm.find(name.substr(0, name.size() - 7) + ".scale", &ss)) {
+                if (ts->type == 0 && ts->elements() == 1)
+                    std::memcpy(&w.scale, gm.shard(ss).tensor_data(*ts), 4);
+            }
+        }
         return w;
     };
     auto L = [](int64_t l, const char* s) { return "blk." + std::to_string(l) + "." + s; };
@@ -294,30 +309,45 @@ bool load(const std::string& path, Model& m, std::string& err) {
         y.lat_up = mat(L(l, "ffn_latent_up.weight"));
         y.sh_up = mat(L(l, "ffn_up_shexp.weight"));
         y.sh_down = mat(L(l, "ffn_down_shexp.weight"));
-        size_t su = 0, sd = 0;
+        size_t su = 0, sd = 0, sr = 0, sb = 0;
         const strata::TensorInfo* tu = find(L(l, "ffn_up_exps.weight"), su);
         const strata::TensorInfo* td = find(L(l, "ffn_down_exps.weight"), sd);
-        if ((int) tu->shape[0] != g.LAT || (int) tu->shape[1] != g.FF || (int) td->shape[0] != g.FF ||
-            (int) td->shape[1] != g.LAT || (int) tu->shape[2] != g.E || (int) td->shape[2] != g.E) {
+        const strata::TensorInfo* tr = find(L(l, "ffn_gate_inp.weight"), sr);
+        const strata::TensorInfo* tb = find(L(l, "exp_probs_b.bias"), sb);
+        if (tu->shape.size() < 3 || td->shape.size() < 3) {
+            err = L(l, "expert tensors are not 3D");
+            return false;
+        }
+        y.FF = (int) tu->shape[1];
+        y.E = (int) tu->shape[2];
+        if (y.E < g.top_k || y.E > 512 || y.FF <= 0 || y.FF % 32 != 0) {
+            err = "a geometry this driver's kernels do not take (head 128, conv 4, state 128, head_dim 64, <= 512 experts, "
+                  "top-k <= 32, widths in whole blocks)";
+            return false;
+        }
+        if ((int) tu->shape[0] != g.LAT || (int) td->shape[0] != y.FF || (int) td->shape[1] != g.LAT ||
+            (int) td->shape[2] != y.E || (int) tr->elements() != g.N * y.E || (int) tb->elements() != y.E) {
             err = L(l, "expert tensors have an unexpected shape");
             return false;
         }
-        if (!K::native_expert_ungated_supported((int) tu->type, (int) td->type, g.LAT, g.FF)) {
+        if (!K::native_expert_ungated_supported((int) tu->type, (int) td->type, g.LAT, y.FF)) {
             err = L(l, "experts are ") + tu->type_name() + "/" + td->type_name() +
                   ", which the native expert kernels do not take";
             return false;
         }
-        y.L = K::native_expert_layout_ungated((int) tu->type, (int) td->type, g.LAT, g.FF);
+        y.L = K::native_expert_layout_ungated((int) tu->type, (int) td->type, g.LAT, y.FF);
         y.stride = (y.L.bytes + 255) / 256 * 256;
-        y.up_bytes = (size_t) g.FF * y.L.gu_row;
+        y.up_bytes = (size_t) y.FF * y.L.gu_row;
         y.d_bytes = (size_t) g.LAT * y.L.d_row;
         y.src_up = gm.shard(su).tensor_data(*tu);
         y.src_down = gm.shard(sd).tensor_data(*td);
-        if (!strata::nemotron_h::cpu_fmt((int) tu->type, (int) td->type, g.LAT, g.FF, y.fmt, err)) return false;
+        if (!strata::nemotron_h::cpu_fmt((int) tu->type, (int) td->type, g.LAT, y.FF, y.fmt, err)) return false;
         if (y.fmt.up_row != y.L.gu_row || y.fmt.d_row != y.L.d_row) {
             err = "the CPU and GPU expert row sizes differ";
             return false;
         }
+        g.E = std::max(g.E, y.E);
+        g.FF = std::max(g.FF, y.FF);
         return true;
     };
     m.layers.resize((size_t) g.n_layers);
@@ -676,8 +706,9 @@ struct Engine {
     /// read by prefetch_issue once that sublayer's kernels are queued too.
     void prefetch_begin(const Layer& Ln, int T) {
         const Geo& g = m->g;
-        f32mm(Ln.moe.router, h, logits_pf, g.N, g.E, T);
-        k_route<<<T, 512, 0, st>>>(logits_pf, Ln.moe.bias, g.E, g.top_k, g.w_scale, g.w_norm, ids_pf, wts_pf);
+        const int E_ = Ln.moe.E;
+        f32mm(Ln.moe.router, h, logits_pf, g.N, E_, T);
+        k_route<<<T, 512, 0, st>>>(logits_pf, Ln.moe.bias, E_, g.top_k, g.w_scale, g.w_norm, ids_pf, wts_pf);
         CK(cudaMemcpyAsync(h_pfids, ids_pf, (size_t) T * g.top_k * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaEventRecord(ev_pfroute, st));
     }
@@ -687,7 +718,7 @@ struct Engine {
         const int mi = Ln.idx, b = mi & 1;
         CK(cudaEventSynchronize(ev_pfroute));
         Pf& P = pf[b];
-        for (int x = 0; x < g.E; ++x) P.slot[(size_t) x] = -1;
+        for (int x = 0; x < M.E; ++x) P.slot[(size_t) x] = -1;
         P.mi = mi;
         const Hy& Hh = hy[(size_t) mi];
         CK(cudaStreamWaitEvent(cst2, ev_pffree[b], 0));
@@ -742,13 +773,16 @@ struct Engine {
         const size_t T = (size_t) tmax, N = (size_t) g.N, Kp = (size_t) g.top_k;
         CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
         x = dalloc(T * N); h = dalloc(T * N); y = dalloc(T * N); y2 = dalloc(T * N);
-        hmain = dalloc(T * N); hlast = dalloc(N); seeds = dalloc(T * N); hmtp = dalloc(T * N);
-        mtp_cat = dalloc(T * 2 * N);
+        hmain = dalloc(T * N); hlast = dalloc(N);
+        if (m->has_mtp) {
+            seeds = dalloc(T * N); hmtp = dalloc(T * N); mtp_cat = dalloc(T * 2 * N);
+        }
         zx = dalloc(T * g.in_proj); xc = dalloc(T * g.conv_ch); yr = dalloc(T * g.ssm_inner); yg = dalloc(T * g.ssm_inner);
         qx = dalloc(T * g.H * kHD); kx = dalloc(T * g.HKV * kHD); vx = dalloc(T * g.HKV * kHD); att = dalloc(T * g.H * kHD);
         logits_r = dalloc(T * g.E); ewts = dalloc(T * Kp);
         hl = dalloc(T * g.LAT); lat = dalloc(T * g.LAT); eparts = dalloc(T * Kp * g.LAT); su = dalloc(T * g.FS);
-        logits = dalloc((size_t) kVerify * g.V); logits_m = dalloc((size_t) g.V);
+        logits = dalloc((size_t) kVerify * g.V);
+        if (m->has_mtp) logits_m = dalloc((size_t) g.V);
         ubuf = dalloc(T * g.FF);
         const int max_in = std::max({2 * g.N, g.ssm_inner, g.H * kHD, g.FS, g.LAT});
         CK(cudaMalloc(&q8, K::native_q8_1_bytes(max_in, 1) * T));
@@ -799,9 +833,11 @@ struct Engine {
         tok = dalloc_t<int32_t>(T);
         pos0 = dalloc_t<int32_t>(1);
         pick = dalloc_t<int32_t>(kVerify);
-        tok_m = dalloc_t<int32_t>(T);
-        pos0_m = dalloc_t<int32_t>(1);
-        pick_m = dalloc_t<int32_t>(1);
+        if (m->has_mtp) {
+            tok_m = dalloc_t<int32_t>(T);
+            pos0_m = dalloc_t<int32_t>(1);
+            pick_m = dalloc_t<int32_t>(1);
+        }
         amv = dalloc((size_t) kArgBlocks * kVerify);
         ami = dalloc_t<int32_t>((size_t) kArgBlocks * kVerify);
         CK(cudaHostAlloc((void**) &hpin, 64 * sizeof(int32_t), cudaHostAllocDefault));
@@ -855,6 +891,8 @@ struct Engine {
     void apply(const Mat& w, const void* q, float* out, int T) {
         if (T > kGemmT) gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
         else mmq(w, q, out, T);
+        if (w.scale != 1.0f)
+            k_scale<<<grid1((int64_t) T * w.n_out), kThreads, 0, st>>>(out, w.scale, (int64_t) T * w.n_out);
     }
     void mm(const Mat& w, const float* xin, float* out, int T) {
         prep(xin, w.n_in, T, q8);
@@ -958,10 +996,10 @@ struct Engine {
     void moe(const Layer& Lr, int T) {
         const Geo& g = m->g;
         const Moe& M = Lr.moe;
-        const int mi = Lr.idx, N = g.N, Kp = g.top_k, LAT = g.LAT, FF = g.FF;
+        const int mi = Lr.idx, N = g.N, Kp = g.top_k, LAT = g.LAT, E_ = M.E, FF = M.FF;
         const int n_ent = T * Kp;
-        f32mm(M.router, h, logits_r, N, g.E, T);
-        k_route<<<T, 512, 0, st>>>(logits_r, M.bias, g.E, Kp, g.w_scale, g.w_norm, ids, ewts);
+        f32mm(M.router, h, logits_r, N, E_, T);
+        k_route<<<T, 512, 0, st>>>(logits_r, M.bias, E_, Kp, g.w_scale, g.w_norm, ids, ewts);
         prep(h, N, T, xq);                     // (h's image serves the latent and the shared expert's up)
         apply(M.lat_down, xq, hl, T);
         const int32_t* prow = nullptr;
@@ -972,10 +1010,10 @@ struct Engine {
             CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaMemcpyAsync(h_hl, hl, (size_t) T * LAT * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaEventRecord(ev_route, st));
-            k_group_hy<<<1, kThreads, 0, st>>>(ids, n_ent, Kp, g.E, Hh.slot_of_d, M.slots, M.stride, grp_ptr, grp_start,
+            k_group_hy<<<1, kThreads, 0, st>>>(ids, n_ent, Kp, E_, Hh.slot_of_d, M.slots, M.stride, grp_ptr, grp_start,
                                                n_groups, ent_dst, ent_tok);
             K::native_expert_grouped_relu2(M.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
-                                           std::min<int64_t>(n_ent, g.E), n_ent, xq_l, escr, eparts, st);
+                                           std::min<int64_t>(n_ent, E_), n_ent, xq_l, escr, eparts, st);
             shared(M, T);
             const auto tw = Clock::now();
             CK(cudaEventSynchronize(ev_route));
@@ -1005,7 +1043,7 @@ struct Engine {
                 for (int x : miss_x) if (c[x]++ == 0) distinct.push_back(x);
                 std::stable_sort(distinct.begin(), distinct.end(), [&](int a, int b) { return c[a] > c[b]; });
                 const int want = std::min<int>(pcie_cap, (int) std::lround(pcie_frac * (double) distinct.size()));
-                pc_slot.assign((size_t) g.E, -1);
+                pc_slot.assign((size_t) E_, -1);
                 CK(cudaStreamWaitEvent(cst2, ev_trfree, 0));
                 for (int i = 0; i < want; ++i) {
                     const int x = distinct[(size_t) i];
@@ -1088,16 +1126,16 @@ struct Engine {
         } else {
             // ---- a prompt chunk: the entries sorted by expert, every expert's rows as two FP16 GEMMs, its weights from
             // its slot or from the stream
-            CK(cudaMemsetAsync(rcnt, 0, (size_t) g.E * 4, st));
+            CK(cudaMemsetAsync(rcnt, 0, (size_t) E_ * 4, st));
             k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, n_ent, rcnt);
-            k_route_scan<<<1, 32, 0, st>>>(rcnt, g.E, rbounds, rcur);
+            k_route_scan<<<1, 32, 0, st>>>(rcnt, E_, rbounds, rcur);
             k_route_scatter<<<grid1(n_ent), kThreads, 0, st>>>(ids, n_ent, Kp, rcur, ent_dst, ent_tok, rinv);
             k_gather_f16<<<grid1((int64_t) n_ent * LAT), kThreads, 0, st>>>(hl, ent_tok, xg16, n_ent, LAT);
-            CK(cudaMemcpyAsync(h_cnt, rcnt, (size_t) g.E * 4, cudaMemcpyDeviceToHost, st));
+            CK(cudaMemcpyAsync(h_cnt, rcnt, (size_t) E_ * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
             Hy& Hh = hy[(size_t) mi];
             int b0 = 0;
-            for (int xid = 0; xid < g.E; ++xid) {
+            for (int xid = 0; xid < E_; ++xid) {
                 const int c = h_cnt[xid];
                 if (!warming) { Hh.score[(size_t) xid] += c; Hh.total[(size_t) xid] += c; }
                 const bool res = Hh.slot_of[(size_t) xid] >= 0;
@@ -1138,7 +1176,7 @@ struct Engine {
         for (int mi : mis) {
             const Moe& M = moe_layer(mi).moe;
             const Hy& Hh = hy[(size_t) mi];
-            for (int xid = 0; xid < m->g.E; ++xid)
+            for (int xid = 0; xid < M.E; ++xid)
                 if (Hh.slot_of[(size_t) xid] < 0)
                     items.push_back({M.up_of(xid), M.down_of(xid), M.up_bytes, M.d_bytes});
         }
@@ -1248,13 +1286,12 @@ struct Engine {
     void rebalance(int max_swaps) {
         static const bool off = std::getenv("STRATA_NH_FIXED_SLOTS") != nullptr;
         if (off || warming) return;
-        const int ne = m->g.E;
         int left = max_swaps;
         CK(cudaStreamSynchronize(st));
         for (size_t mi = 0; mi < hy.size() && left > 0; ++mi) {
             Hy& Hh = hy[mi];
             const Moe& M = moe_layer((int) mi).moe;
-            const int S_ = M.n_slots;
+            const int ne = M.E, S_ = M.n_slots;
             if (S_ <= 0 || S_ >= ne) continue;
             std::vector<int> order((size_t) ne);
             for (int x_ = 0; x_ < ne; ++x_) order[(size_t) x_] = x_;
@@ -1411,6 +1448,12 @@ struct Engine {
 // ------------------------------------------------------------------------------------------------ expert placement
 /// MemAvailable from /proc/meminfo in bytes (0 when unknown).
 size_t mem_available() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) return (size_t) ms.ullAvailPhys;
+    return 0;
+#else
     std::ifstream f("/proc/meminfo");
     std::string k;
     size_t v = 0;
@@ -1418,6 +1461,7 @@ size_t mem_available() {
     while (f >> k >> v >> unit)
         if (k == "MemAvailable:") return v * 1024;
     return 0;
+#endif
 }
 
 /// The expert profile (Flash-Next's expert-profile.bin idea for this family): per MoE slot index (the main layers,
@@ -1447,7 +1491,8 @@ bool save_profile(const std::string& path, const std::vector<Engine::Hy>& hy, in
         f.write((const char*) hd, sizeof hd);
         std::vector<float> row((size_t) E);
         for (const Engine::Hy& H : hy) {
-            for (int x = 0; x < E; ++x) row[(size_t) x] = (float) H.total[(size_t) x];
+            std::fill(row.begin(), row.end(), 0.f);
+            for (size_t x = 0; x < H.total.size() && x < (size_t) E; ++x) row[x] = (float) H.total[x];
             f.write((const char*) row.data(), (std::streamsize) (E * 4));
         }
         if (!f) return false;
@@ -1469,10 +1514,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int slots,
         if (L.kind == Kind::Moe) all.push_back(&L.moe);
     if (m.has_mtp) all.push_back(&m.mtp_moe.moe);
     size_t per_slot = 0, max_stride = 0, total = 0;
+    int min_e = g.E;
     for (Moe* M : all) {
         per_slot += M->stride;
         max_stride = std::max(max_stride, M->stride);
-        total += (size_t) g.E * M->stride;
+        total += (size_t) M->E * M->stride;
+        min_e = std::min(min_e, M->E);
     }
     // ---- the pinned arena
     bool have_arena = false;
@@ -1508,19 +1555,21 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int slots,
             }
             if (base != nullptr) {
                 size_t off = 0;
+                std::vector<std::pair<Moe*, int>> items;
                 for (Moe* M : all) {
                     M->host = base + off;
-                    off += (size_t) g.E * M->stride;
+                    off += (size_t) M->E * M->stride;
+                    for (int e = 0; e < M->E; ++e) items.push_back({M, e});
                 }
                 // filled by 6 threads (from the page cache, or the disk on a cold start)
                 std::atomic<int> next{0};
-                const int n_items = (int) all.size() * g.E;
+                const int n_items = (int) items.size();
                 std::vector<std::thread> ts;
                 for (int k = 0; k < 6; ++k)
                     ts.emplace_back([&] {
                         for (int i; (i = next.fetch_add(1)) < n_items;) {
-                            Moe& M = *all[(size_t) (i / g.E)];
-                            const int e = i % g.E;
+                            Moe& M = *items[(size_t) i].first;
+                            const int e = items[(size_t) i].second;
                             uint8_t* dst = M.host + (size_t) e * M.stride;
                             std::memcpy(dst, M.src_up + (size_t) e * M.up_bytes, M.up_bytes);
                             std::memcpy(dst + M.L.down_off, M.src_down + (size_t) e * M.d_bytes, M.d_bytes);
@@ -1546,52 +1595,6 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int slots,
     if (E.pcie_cap > 0) E.pcbuf = dalloc_t<uint8_t>((size_t) E.pcie_cap * max_stride + kTail);
     if (E.pf_cap > 0)
         for (int b = 0; b < 2; ++b) E.pfbuf[b] = dalloc_t<uint8_t>((size_t) E.pf_cap * max_stride + kTail);
-    size_t fr = 0, tot = 0;
-    CK(cudaMemGetInfo(&fr, &tot));
-    const size_t reserve = (size_t) std::max(256, reserve_mib) << 20;   // --vram-reserve-mib (the server's: 700)
-    const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30)) : (fr > reserve ? fr - reserve : 0);
-    int S_ = slots > 0 ? std::min(g.E, slots) : (int) std::min<size_t>((size_t) g.E, budget / std::max<size_t>(per_slot, 1));
-    if (S_ < 0) S_ = 0;
-    std::vector<std::vector<double>> prof;
-    const bool have_prof = !profile.empty() && load_profile(profile, (int) all.size(), g.E, prof);
-    if (!profile.empty())
-        std::fprintf(stderr, "strata-nh: expert profile %s: %s\n", profile.c_str(), have_prof ? "loaded" : "not usable, slots start at 0 .. S-1");
-    E.hy.resize(all.size());
-    for (size_t mi = 0; mi < all.size(); ++mi) {
-        Moe& M = *all[mi];
-        M.n_slots = S_;
-        CK(cudaMalloc(&M.slots, M.stride * (size_t) std::max(S_, 1) + kTail));
-        CK(cudaMemset(M.slots, 0, M.stride * (size_t) std::max(S_, 1) + kTail));
-        std::vector<int> order((size_t) g.E);
-        for (int x = 0; x < g.E; ++x) order[(size_t) x] = x;
-        if (have_prof)
-            std::stable_sort(order.begin(), order.end(),
-                             [&](int a, int b) { return prof[mi][(size_t) a] > prof[mi][(size_t) b]; });
-        Engine::Hy& H = E.hy[mi];
-        H.slot_of.assign((size_t) g.E, -1);
-        H.exp_in_slot.assign((size_t) S_, 0);
-        for (int s = 0; s < S_; ++s) {
-            const int x = order[(size_t) s];
-            H.slot_of[(size_t) x] = s;
-            H.exp_in_slot[(size_t) s] = x;
-            CK(cudaMemcpy(M.slots + (size_t) s * M.stride, M.up_of(x), M.up_bytes, cudaMemcpyHostToDevice));
-            CK(cudaMemcpy(M.slots + (size_t) s * M.stride + M.L.down_off, M.down_of(x), M.d_bytes, cudaMemcpyHostToDevice));
-        }
-        // the profile is also the adaptive tier's prior: its counts scaled to `prior` tokens' worth of routing, so a
-        // request's first counts move only the experts it really prefers (they halve with every rebalance as usual).
-        // STRATA_NH_PRIOR_TOKENS: that weight (default 1024).
-        H.score.assign((size_t) g.E, 0.0);
-        if (have_prof) {
-            static const double prior = std::getenv("STRATA_NH_PRIOR_TOKENS") ? std::atof(std::getenv("STRATA_NH_PRIOR_TOKENS")) : 1024.0;
-            double sum = 0;
-            for (double v : prof[mi]) sum += v;
-            if (sum > 0)
-                for (int x = 0; x < g.E; ++x) H.score[(size_t) x] = prof[mi][(size_t) x] * prior * g.top_k / sum;
-        }
-        H.total = have_prof ? prof[mi] : std::vector<double>((size_t) g.E, 0.0);
-        CK(cudaMalloc(&H.slot_of_d, (size_t) g.E * 4));
-        CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) g.E * 4, cudaMemcpyHostToDevice));
-    }
     const size_t T = (size_t) E.tmax, Kp = (size_t) g.top_k;
     CK(cudaHostAlloc((void**) &E.h_hl, T * g.LAT * 4, cudaHostAllocDefault));
     CK(cudaHostAlloc((void**) &E.cpu_out, T * Kp * g.LAT * 4, cudaHostAllocDefault));
@@ -1602,13 +1605,80 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int slots,
     E.d_miss = dalloc_t<int32_t>(T * Kp);
     E.init_transient();
     CK(cudaEventCreateWithFlags(&E.ev_route, cudaEventDisableTiming | cudaEventBlockingSync));
+    size_t fr = 0, tot = 0;
+    CK(cudaMemGetInfo(&fr, &tot));
+    const size_t reserve = (size_t) std::max(256, reserve_mib) << 20;   // --vram-reserve-mib (the server's: 700)
+    const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30)) : (fr > reserve ? fr - reserve : 0);
+    auto vram_for = [&](int s) {
+        size_t b = 0;
+        for (Moe* M : all) b += (size_t) std::max(std::min(M->E, s), 1) * M->stride + kTail + (size_t) M->E * 4;
+        return b;
+    };
+    int S_ = 0;
+    if (slots > 0) {
+        S_ = std::min(g.E, slots);
+    } else {
+        while (S_ < g.E && vram_for(S_ + 1) <= budget) ++S_;
+    }
+    std::vector<std::vector<double>> prof;
+    const bool have_prof = !profile.empty() && load_profile(profile, (int) all.size(), g.E, prof);
+    if (!profile.empty())
+        std::fprintf(stderr, "strata-nh: expert profile %s: %s\n", profile.c_str(), have_prof ? "loaded" : "not usable, slots start at 0 .. S-1");
+    E.hy.resize(all.size());
+    size_t vram_slots = 0;
+    for (size_t mi = 0; mi < all.size(); ++mi) {
+        Moe& M = *all[mi];
+        const int ne = M.E, ns = std::min(ne, S_);
+        M.n_slots = ns;
+        vram_slots += (size_t) ns * M.stride;
+        CK(cudaMalloc(&M.slots, M.stride * (size_t) std::max(ns, 1) + kTail));
+        CK(cudaMemset(M.slots, 0, M.stride * (size_t) std::max(ns, 1) + kTail));
+        std::vector<int> order((size_t) ne);
+        for (int x = 0; x < ne; ++x) order[(size_t) x] = x;
+        if (have_prof)
+            std::stable_sort(order.begin(), order.end(),
+                             [&](int a, int b) { return prof[mi][(size_t) a] > prof[mi][(size_t) b]; });
+        Engine::Hy& H = E.hy[mi];
+        H.slot_of.assign((size_t) ne, -1);
+        H.exp_in_slot.assign((size_t) ns, 0);
+        for (int s = 0; s < ns; ++s) {
+            const int x = order[(size_t) s];
+            H.slot_of[(size_t) x] = s;
+            H.exp_in_slot[(size_t) s] = x;
+            CK(cudaMemcpy(M.slots + (size_t) s * M.stride, M.up_of(x), M.up_bytes, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(M.slots + (size_t) s * M.stride + M.L.down_off, M.down_of(x), M.d_bytes, cudaMemcpyHostToDevice));
+        }
+        // the profile is also the adaptive tier's prior: its counts scaled to `prior` tokens' worth of routing, so a
+        // request's first counts move only the experts it really prefers (they halve with every rebalance as usual).
+        // STRATA_NH_PRIOR_TOKENS: that weight (default 1024).
+        H.score.assign((size_t) ne, 0.0);
+        if (have_prof) {
+            static const double prior = std::getenv("STRATA_NH_PRIOR_TOKENS") ? std::atof(std::getenv("STRATA_NH_PRIOR_TOKENS")) : 1024.0;
+            double sum = 0;
+            for (int x = 0; x < ne; ++x) sum += prof[mi][(size_t) x];
+            if (sum > 0)
+                for (int x = 0; x < ne; ++x) H.score[(size_t) x] = prof[mi][(size_t) x] * prior * g.top_k / sum;
+        }
+        H.total.assign((size_t) ne, 0.0);
+        if (have_prof)
+            for (int x = 0; x < ne; ++x) H.total[(size_t) x] = prof[mi][(size_t) x];
+        CK(cudaMalloc(&H.slot_of_d, (size_t) ne * 4));
+        CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
+    }
     E.pool = std::make_unique<strata::nemotron_h::CpuExperts>(threads);
     CK(cudaDeviceSynchronize());
-    std::fprintf(stderr, "strata-nh: hybrid experts: %d of %d per layer in VRAM (%.2f GiB of %.2f GiB), a batch of <= %d rows "
-                 "on the GPU + %d CPU threads (PCIe share %.2f, up to %d experts; prefetch %d), bigger chunks streamed through "
-                 "%d buffers (%.2f GiB); %.1f s\n", S_, g.E, (double) S_ * per_slot / (1 << 30), (double) total / (1 << 30),
-                 E.hybrid_t, E.pool->threads(), E.pcie_frac, E.pcie_cap, E.pf_cap, E.xs.nr,
-                 (double) E.xs.nr * max_stride / (1 << 30), ms_since(t0) / 1000.0);
+    if (min_e == g.E)
+        std::fprintf(stderr, "strata-nh: hybrid experts: %d of %d per layer in VRAM (%.2f GiB of %.2f GiB), a batch of <= %d rows "
+                     "on the GPU + %d CPU threads (PCIe share %.2f, up to %d experts; prefetch %d), bigger chunks streamed through "
+                     "%d buffers (%.2f GiB); %.1f s\n", S_, g.E, (double) vram_slots / (1 << 30), (double) total / (1 << 30),
+                     E.hybrid_t, E.pool->threads(), E.pcie_frac, E.pcie_cap, E.pf_cap, E.xs.nr,
+                     (double) E.xs.nr * max_stride / (1 << 30), ms_since(t0) / 1000.0);
+    else
+        std::fprintf(stderr, "strata-nh: hybrid experts: up to %d of %d..%d per layer in VRAM (%.2f GiB of %.2f GiB), a batch of <= %d rows "
+                     "on the GPU + %d CPU threads (PCIe share %.2f, up to %d experts; prefetch %d), bigger chunks streamed through "
+                     "%d buffers (%.2f GiB); %.1f s\n", S_, min_e, g.E, (double) vram_slots / (1 << 30), (double) total / (1 << 30),
+                     E.hybrid_t, E.pool->threads(), E.pcie_frac, E.pcie_cap, E.pf_cap, E.xs.nr,
+                     (double) E.xs.nr * max_stride / (1 << 30), ms_since(t0) / 1000.0);
     (void) err;
     return true;
 }

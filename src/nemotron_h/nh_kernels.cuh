@@ -162,6 +162,10 @@ __global__ void k_to_f16(const float* x, __half* y, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = __float2half(x[i]);
 }
+__global__ void k_scale(float* x, float s, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] *= s;
+}
 /// x = relu(x)^2 in place (the shared expert's hidden).
 __global__ void k_relu2(float* x, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;

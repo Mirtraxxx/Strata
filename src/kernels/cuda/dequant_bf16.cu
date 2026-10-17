@@ -32,6 +32,13 @@ __device__ __forceinline__ void put(H16* o, int i, float v) { o[i].v = __half_as
 __device__ __forceinline__ void put(float* o, int i, float v) { o[i] = v; }
 
 __constant__ int8_t kv_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+__constant__ int8_t kv_fp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+__device__ __forceinline__ float ue4m3_to_f32_half(uint8_t x) {
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const uint32_t exp = (x >> 3) & 0xF, man = x & 0x7;
+    return exp == 0 ? (float) man * 0.0009765625f : __uint_as_float(((exp + 119u) << 23) | (man << 20));
+}
 
 __device__ __forceinline__ void scale_min_k4(int j, const uint8_t* q, int& d, int& m) {
     if (j < 4) { d = q[j] & 63; m = q[j + 4] & 63; }
@@ -50,6 +57,18 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
             const int e = e0 + j;
             const int q = (b[2 + e / 4] >> ((e % 4) * 2)) & 3;
             put(out, j, (float) (q - 1) * d);
+        }
+    } else if constexpr (TYPE == 40) {                            // NVFP4: 64 per block of 36 B (d[4], qs[32])
+        const uint8_t* b = row_blocks + (size_t) (gi_in_row / 2) * 36;
+        const int s0 = (gi_in_row % 2) * 2;
+        for (int sub = 0; sub < 2; ++sub) {
+            const int s = s0 + sub;
+            const float d = ue4m3_to_f32_half(b[s]);
+            const uint8_t* qs = b + 4 + s * 8;
+            for (int j = 0; j < 8; ++j) {
+                put(out, sub * 16 + j, (float) kv_fp4[qs[j] & 0x0F] * d);
+                put(out, sub * 16 + j + 8, (float) kv_fp4[qs[j] >> 4] * d);
+            }
         }
     } else if constexpr (TYPE == 2) {                              // Q4_0
         const uint8_t* b = row_blocks + (size_t) gi_in_row * 18;
@@ -317,6 +336,7 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
     case 13: block_elems = 256; block_bytes = 176; return true;
     case 14: block_elems = 256; block_bytes = 210; return true;
     case 23: block_elems = 256; block_bytes = 136; return true;
+    case 40: block_elems = 64; block_bytes = 36; return true;
     case 42: block_elems = 64; block_bytes = 18; return true;
     default: return false;
     }
@@ -371,6 +391,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     case 14: STRATA_DQ(14);
     case 20: STRATA_DQ(20);
     case 23: STRATA_DQ(23);
+    case 40: STRATA_DQ(40);
     case 42: STRATA_DQ(42);
     }
 #undef STRATA_DQ
