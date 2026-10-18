@@ -146,3 +146,96 @@ said, `--expert-slots 78` for the A/B rows so every row has the same VRAM tier):
 
 Not done yet: MMQ for the prompt's experts (it takes a per-expert FP16 GEMM today), video input, HIP and SYCL builds,
 a setup entry.
+
+## Nemotron 3.5 Bolt 74B-A9B
+
+The same path runs NVIDIA's Bolt (`NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF`, also `nemotron_h_moe`; the
+abliterated files of the same layout load the same way). What differs from Super VL:
+
+- the MoE layers do not share one geometry: 240-496 routed experts and a latent width of 1536-2560 per layer, top 9,
+  a shared expert of 5376. The engine reads `E` and `FF` per layer (slots, arena, profile, CPU and GPU experts);
+- the routed experts are IQ2_XXS (15.9 GiB of the 24 GB file) and the Mamba `in_proj` / `out_proj` are NVFP4
+  (ggml type 40). Both go through the existing native kernels: IQ2_XXS is added to `STRATA_D_FMTS` and NVFP4 to
+  `native_mmvq` (an Ampere card has no FP4 hardware, so it is dequantized in the kernel); the vector NVFP4 dequant is
+  bitwise equal to the scalar one (`dequant_wide_parity`, 418 cases). Both edits are additive: no other format's
+  instance changes;
+- there is no MTP block. Speculative decoding uses NVIDIA's separate 1.13B LiLiCorr DFlash drafter instead (below);
+- the tokenizer's `pre` is `pixtral`: llama.cpp's LLAMA3 split, merges ignored, BOS prepended.
+  `tools/strata_tokenizer.py` gained that split (15/15 test strings identical to `llama-tokenize`), and the server
+  prepends BOS once on the rendered prompt when the pack says `add_bos_token` (Qwen packs say false: unchanged).
+
+The whole model is 24 GB, so on a 24 GB card most of the experts can be resident. Bolt-specific work:
+
+- **prompt experts on MMQ**: a prompt chunk runs each group of experts as one MMQ launch that reads IQ2_XXS directly
+  (not a per-expert FP16 GEMM), with the next group's expert copies double-buffered on their own stream.
+  `STRATA_NH_EXPERT_MMQ=0` goes back to the FP16 GEMMs;
+- **Mamba-2 for prompts and decode** (`nh_ssm_scan.cu`): a chunked SSD scan for prompt chunks, a tiled prompt conv,
+  and a coalesced single-token state update (65 -> 12 us a layer). `nh_ssm_scan_test` checks the chunked scan
+  against the sequential one from T = 1 to 8192, with no model needed;
+- **small decode kernels**: warp-shuffle add+norm and router kernels (the old ones used a single block), about 2.5 ms
+  less GPU time a token;
+- **elastic VRAM**: `--vram-reserve-mib N` is what the slots leave free (default 1024). The server's `/v1/vram`
+  shrinks the expert slots so another program can borrow the card, and grows them back afterwards. Dense weights
+  and the KV cache never move. `--vram-elastic` is accepted for the server's sake (the slots are what resize);
+- **DFlash** (`--dflash <LiLiCorr GGUF>`, `--dflash-d D`, default 4; `nh_dflash.cu`): the drafter reads the residual
+  stream of its 6 target sublayers, drafts D tokens with its lattice corrector, and the engine verifies them in one
+  window of D + 1 rows with the same commit + Mamba recompute as `--mtp`. The drafter's FFN stays packed NVFP4
+  (1.53 -> 0.43 GB of VRAM; FP32 math, since an FP16-accumulating version overflowed on real activations). Sampled
+  requests are verified by speculative sampling against the server's own sampler (the same penalty, top-k, min-p and
+  top-p function), so their output distribution is exactly plain sampling's (checked with 4M Monte Carlo draws: every
+  row within 0.0013). With `--dflash`, `--pcie-frac` defaults to 0.5, because a verify window's misses share many
+  experts; without it the default stays 0, as for Super VL;
+- `STRATA_NH_PROF=1`: a per-phase timer for prompt chunks (CUDA events; off by default).
+
+| File | What |
+|---|---|
+| `src/nemotron_h/nh_dflash.cu`, `.hpp` | the LiLiCorr drafter: its 6-layer feature taps, attention + NVFP4 FFN, the lattice |
+| `src/nemotron_h/nh_ssm_scan.cu`, `.cuh` | chunked SSD prompt scan, coalesced decode state update |
+| `src/nemotron_h/nh_ssm_scan_test.cu` | the chunked scan against the sequential one (synthetic) |
+| `tools/nemotron_h/nh_dflash_dump.cpp` | llama.cpp's side of the drafter check (draft logits + lattice dumps) |
+| `tools/nemotron_h/nh_dflash_test.cpp` | the drafter's logits and lattice against those dumps |
+
+```bash
+strata-nh --model <Bolt GGUF> --max-context 131072 --vram-reserve-mib 512 --dflash <LiLiCorr GGUF> --bench-pp 2048 --bench-tg 128
+# server config: "args" ["--model", <Bolt GGUF>, "--max-context", "131072", "--vram-reserve-mib", "512",
+# "--dflash", <LiLiCorr GGUF>], "arch" "nemotron_h_moe", "vram_elastic" true; sampling temp 1.0, top-p 0.95
+```
+
+### Measured (Bolt)
+
+On another PC: RTX 3090 (24 GB), Ryzen 7 5700X (8 cores, AVX2), 64 GB DDR4 at 2800 MT/s. NVIDIA's stock
+`NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf`, 128K context, 512 MiB kept free (296-347 expert slots a layer, ~96% of
+decode routes resident), llama.cpp `c0fd786` as the reference, 2026-10-18.
+
+- **Parity** (`parity.py`, 5 chat prompts x 48 teacher-forced steps): first token 5/5, mean KL 0.00062 (median
+  0.000010, p99 0.0079), top-1 0.9958 against llama.cpp CUDA. Long prompts (~1.5-1.9K tokens, 96 steps): mean KL
+  0.00086, top-1 0.9896.
+- **The drafter** (`nh_dflash_test`, 5 short + 2 long prompts): draft logits top-1 1.000 at all 7 positions, KL
+  <= 0.00053. Fed llama.cpp's logits, the lattice gives the same candidates on every row, and every argmax miss is a
+  near tie in llama.cpp too.
+- **Speed** (`--bench-pp 2048 --bench-tg 128`, run 0 / 1): prompt 1,209 / 1,488 tok/s, decode 45.8 / 52.6 tok/s.
+  llama.cpp on the same card (`llama-bench`, small context, no drafter): everything on the GPU 1,013 / 62.1; with
+  50 blocks' experts in RAM (`-ncmoe 50`, which fits 256K context) 397 / 25.0.
+
+| change (same card, plain decode unless said) | prompt pp2048 | decode tg |
+|---|---|---|
+| #2740 + per-layer geometry + NVFP4 (256K, 2 GiB free) | 758-763 | 28-30 |
+| + prompt experts on MMQ | 1,038-1,178 | about the same |
+| 128K, 512 MiB free (more slots) | 1,117-1,227 | 34.4-39.2 |
+| + double-buffered copies, NVFP4 vector dequant, small decode kernels, SSD decode update | 1,209-1,488 | 45.8-52.6 |
+
+- **DFlash in decode** (greedy, 200 tokens; D and the PCIe share swept): D = 4 with share 0.5 is 72.5 tok/s on chat
+  and 78.0 on code against 36.7 / 37.4 plain (2.0x / 2.1x). D = 5 is 81.9 on code but slower on chat. A share of 1.0
+  loses to 0.5 (the uploads and the CPU experts stop overlapping), and plain decode does not care about the share.
+- **Through the server** (temp 1.0, top-p 0.95, top-k 64, DFlash on): a ~90-token paragraph at 53.3 tok/s, a
+  300-token history answer at 50.3, a 300-token Python function at 73.6, short answers ~62. With `/v1/vram` asking
+  for 12 GB, the slots shrank to 520 (from 10,608) and 12.3 GB was free (a short answer at 27.4 tok/s); growing back
+  restored 10,608 slots (57.1 tok/s). The free VRAM never went under 616 MiB over 31 samples. Sampling costs DFlash
+  about a third against greedy on chat (sampled tokens follow the draft less often).
+- `--bench-tg` with `--dflash` loaded: 31.8 / 43.5 tok/s. The bench decodes without drafting, so this only shows
+  the drafter's ~1.2 GB taken from the expert slots.
+
+Not tested: Super VL 120B with these changes (it does not fit this PC's RAM). Its options keep their defaults
+(`--pcie-frac` stays 0 without `--dflash`), and the new IQ2_XXS / NVFP4 instances are for types its file does not
+use. But the add+norm, router and Mamba scan kernels are shared by both models, so Super VL runs the new ones too,
+and they have been checked on Bolt only. HIP and SYCL were not built either.

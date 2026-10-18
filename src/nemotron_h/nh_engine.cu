@@ -13,13 +13,16 @@
 //   * the routed experts are 78 GB: the hybrid mode always - per MoE layer the same number of VRAM slots, a batch of
 //     up to --hybrid-rows rows runs its resident experts on the GPU and the others on the CPU pool (ggml-cpu, read
 //     straight from the mapped GGUF), a bigger prompt chunk streams every non-resident expert through a ring of
-//     VRAM buffers (a copy thread feeding a copy stream) into per-expert FP16 GEMMs;
+//     VRAM buffers (a copy thread feeding a copy stream) into grouped IQ MMQ (the weights stay quantized);
 //   * the GGUF's MTP block (blk.88: eh_proj over [enorm(e) | hnorm(h)], attention, MoE, the LayerNorm head norm)
 //     drafts for greedy requests (--mtp N), verified by the main model (the Mamba state is committed afterwards);
+//   * or DFlash (--dflash GGUF, Bolt): the LiLiCorr block drafter (nh_dflash) reads the residual entering 6 target
+//     sublayers and drafts up to 7 tokens a step, verified the same way;
 //   * images (GENI): strata-vision's rows (llama.cpp mtmd, the mmproj's RADIO tower + projector) in place of the
 //     prompt's <image> tokens (the server writes <img> <image> x n </img>).
 //
-// Modes: --serve (serve/server.py's engine protocol: READY / GEN / GENI / T / DONE / STOP / PP), --tokens IDS [--n N]
+// Modes: --serve (serve/server.py's engine protocol: READY / GEN / GENI / T / DONE / STOP / PP, and VRAM for
+// POST /v1/vram), --tokens IDS [--n N]
 // [--force IDS] [--dump-full-logits F] (tools/nemotron_h's parity interface), --bench-pp N / --bench-tg N.
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -27,8 +30,13 @@
 #include "strata/nemotron_h/cpu_experts.hpp"
 #include "strata/nemotron_h/engine.hpp"
 #include "strata/prefill/gemm.hpp"
+#if defined(STRATA_PREFILL_MMQ)
+#include "strata/prefill/moe_mmq.hpp"
+#endif
 
+#include "nh_dflash.hpp"
 #include "nh_kernels.cuh"
+#include "nh_ssm_scan.cuh"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -45,6 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -56,7 +65,16 @@
 #include <tuple>
 #include <vector>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -64,6 +82,9 @@
 namespace {
 
 namespace K = strata::kernels;
+#if defined(STRATA_PREFILL_MMQ)
+namespace MMQ = strata::prefill::mmq;
+#endif
 using namespace nh;
 
 #define CK(x)                                                                                                          \
@@ -75,6 +96,68 @@ using namespace nh;
         }                                                                                                              \
     } while (0)
 
+/// Free and total VRAM in bytes: cudaMemGetInfo capped by NVML's device-wide free memory (on Windows WDDM,
+/// cudaMemGetInfo reports this process's WDDM budget room and does not subtract all of the desktop's / other
+/// processes' allocations that nvidia-smi counts).
+void vram_info(size_t& fr, size_t& tot) {
+    CK(cudaMemGetInfo(&fr, &tot));
+    struct NvmlMem {
+        unsigned long long total, free, used;
+    };
+    struct Nvml {
+        using InitFn = int (*)();
+        using ByPciFn = int (*)(const char*, void**);
+        using ByIdxFn = int (*)(unsigned int, void**);
+        using MemFn = int (*)(void*, NvmlMem*);
+        ByPciFn by_pci = nullptr;
+        ByIdxFn by_idx = nullptr;
+        MemFn mem = nullptr;
+        bool ok = false;
+        Nvml() {
+#if defined(_WIN32)
+            HMODULE lib = LoadLibraryA("nvml.dll");
+            if (!lib) {
+                const char* pf = std::getenv("ProgramFiles");
+                const std::string p = std::string(pf ? pf : "C:\\Program Files") + "\\NVIDIA Corporation\\NVSMI\\nvml.dll";
+                lib = LoadLibraryA(p.c_str());
+            }
+            auto sym = [&](const char* n) -> void* { return lib ? (void*) GetProcAddress(lib, n) : nullptr; };
+#else
+            void* lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+            if (!lib) lib = dlopen("libnvidia-ml.so", RTLD_LAZY);
+            auto sym = [&](const char* n) -> void* { return lib ? dlsym(lib, n) : nullptr; };
+#endif
+            if (!lib) return;
+            auto init = (InitFn) (sym("nvmlInit_v2") ? sym("nvmlInit_v2") : sym("nvmlInit"));
+            by_pci = (ByPciFn) (sym("nvmlDeviceGetHandleByPciBusId_v2") ? sym("nvmlDeviceGetHandleByPciBusId_v2")
+                                                                        : sym("nvmlDeviceGetHandleByPciBusId"));
+            by_idx = (ByIdxFn) (sym("nvmlDeviceGetHandleByIndex_v2") ? sym("nvmlDeviceGetHandleByIndex_v2")
+                                                                     : sym("nvmlDeviceGetHandleByIndex"));
+            mem = (MemFn) sym("nvmlDeviceGetMemoryInfo");
+            ok = init && mem && (by_pci || by_idx) && init() == 0;
+        }
+    };
+    static Nvml nvml;
+    if (!nvml.ok) return;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    void* h = nullptr;
+    char pci[64] = {};
+    if (cudaDeviceGetPCIBusId(pci, sizeof pci, dev) != cudaSuccess || !nvml.by_pci || nvml.by_pci(pci, &h) != 0) {
+        (void) cudaGetLastError();
+        if (!nvml.by_idx || nvml.by_idx((unsigned int) dev, &h) != 0) return;
+    }
+    NvmlMem m{};
+    if (nvml.mem(h, &m) == 0 && m.total > 0) {
+        const size_t nf = m.total > m.used ? std::min<size_t>((size_t) m.free, (size_t) (m.total - m.used)) : (size_t) m.free;
+        fr = std::min<size_t>(fr, nf);
+        tot = (size_t) m.total;
+    }
+}
+
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 unsigned grid1(int64_t n, int b = kThreads) { return (unsigned) ((n + b - 1) / b); }
@@ -84,17 +167,20 @@ constexpr int kImagePad = 18;          // <image>: the rows strata-vision's embe
 constexpr int kEos = 11;               // <|im_end|> (tokenizer.ggml.eos_token_id)
 constexpr int kEos2 = 2;               // </s>
 constexpr size_t kTail = 4096;         // zeroed bytes after the last slot (a kernel reading a little past a matrix)
+constexpr size_t kAllocGran = (size_t) 2 << 20;   // the slot buffers' planned cudaMalloc rounding
 
 // ------------------------------------------------------------------------------------------------ the model
 struct Mat {
     const uint8_t* d = nullptr;   // device, GGUF blocks
     int type = -1;
     int n_in = 0, n_out = 0;
+    float scale = 1.0f;           // companion .scale tensor (NVFP4), 1.0 when absent
 };
 
 enum class Kind { Mamba, Attn, Moe };
 
 struct Moe {
+    int E = 0, FF = 0;                                 // routed expert count and width of this layer
     const float *router = nullptr, *bias = nullptr;   // [E][N] f32, [E]
     Mat lat_down, lat_up, sh_up, sh_down;
     K::NativeExpertLayout L;                           // [up | down] blobs (ungated)
@@ -213,7 +299,13 @@ bool load(const std::string& path, Model& m, std::string& err) {
     const std::string p = "nemotron_h_moe.";
     auto num = [&](const std::string& k, double dflt) {
         const strata::MetaValue* v = meta(gm, p + k);
-        return v ? v->num() : dflt;
+        if (!v) return dflt;
+        if (v->type == strata::MetaType::ARRAY) {
+            double mx = 0;
+            for (const strata::MetaValue& it : v->items) mx = std::max(mx, it.num());
+            return mx > 0 ? mx : dflt;
+        }
+        return v->num();
     };
     Geo& g = m.g;
     g.n_all = (int) num("block_count", 0);
@@ -222,9 +314,9 @@ bool load(const std::string& path, Model& m, std::string& err) {
     g.N = (int) num("embedding_length", 0);
     g.V = (int) num("vocab_size", 0);
     g.H = (int) num("attention.head_count", 0);
-    g.E = (int) num("expert_count", 0);
+    g.E = 0;
     g.top_k = (int) num("expert_used_count", 0);
-    g.FF = (int) num("expert_feed_forward_length", 0);
+    g.FF = 0;
     g.FS = (int) num("expert_shared_feed_forward_length", 0);
     g.LAT = (int) num("moe_latent_size", 0);
     g.w_norm = num("expert_weights_norm", 1) != 0;
@@ -243,8 +335,8 @@ bool load(const std::string& path, Model& m, std::string& err) {
         if (const strata::TensorInfo* t = gm.find("token_embd.weight")) g.V = (int) t->shape[1];
     }
     if (g.n_layers <= 0 || g.N % 256 || key_len != kHD || g.ssm_conv != 4 || g.ssm_N != kSsmN ||
-        g.ssm_inner / g.ssm_H != kSsmP || g.ssm_H % g.ssm_G || g.E > 512 || g.top_k > kMaxTopK || g.top_k < 1 ||
-        g.LAT % 256 || g.FF % 32 || g.FS % 256 || g.ssm_inner % g.ssm_G) {
+        g.ssm_inner / g.ssm_H != kSsmP || g.ssm_H % g.ssm_G || g.top_k > kMaxTopK || g.top_k < 1 ||
+        g.LAT % 256 || g.FS % 256 || g.ssm_inner % g.ssm_G) {
         err = "a geometry this driver's kernels do not take (head 128, conv 4, state 128, head_dim 64, <= 512 experts, "
               "top-k <= 32, widths in whole blocks)";
         return false;
@@ -284,6 +376,13 @@ bool load(const std::string& path, Model& m, std::string& err) {
         CK(cudaMemcpy(d, gm.shard(s).tensor_data(*t), nb, cudaMemcpyHostToDevice));
         bytes += nb;
         w.d = d;
+        if (name.size() > 7 && name.compare(name.size() - 7, 7, ".weight") == 0) {
+            size_t ss = 0;
+            if (const strata::TensorInfo* ts = gm.find(name.substr(0, name.size() - 7) + ".scale", &ss)) {
+                if (ts->type == 0 && ts->elements() == 1)
+                    std::memcpy(&w.scale, gm.shard(ss).tensor_data(*ts), 4);
+            }
+        }
         return w;
     };
     auto L = [](int64_t l, const char* s) { return "blk." + std::to_string(l) + "." + s; };
@@ -294,30 +393,45 @@ bool load(const std::string& path, Model& m, std::string& err) {
         y.lat_up = mat(L(l, "ffn_latent_up.weight"));
         y.sh_up = mat(L(l, "ffn_up_shexp.weight"));
         y.sh_down = mat(L(l, "ffn_down_shexp.weight"));
-        size_t su = 0, sd = 0;
+        size_t su = 0, sd = 0, sr = 0, sb = 0;
         const strata::TensorInfo* tu = find(L(l, "ffn_up_exps.weight"), su);
         const strata::TensorInfo* td = find(L(l, "ffn_down_exps.weight"), sd);
-        if ((int) tu->shape[0] != g.LAT || (int) tu->shape[1] != g.FF || (int) td->shape[0] != g.FF ||
-            (int) td->shape[1] != g.LAT || (int) tu->shape[2] != g.E || (int) td->shape[2] != g.E) {
+        const strata::TensorInfo* tr = find(L(l, "ffn_gate_inp.weight"), sr);
+        const strata::TensorInfo* tb = find(L(l, "exp_probs_b.bias"), sb);
+        if (tu->shape.size() < 3 || td->shape.size() < 3) {
+            err = L(l, "expert tensors are not 3D");
+            return false;
+        }
+        y.FF = (int) tu->shape[1];
+        y.E = (int) tu->shape[2];
+        if (y.E < g.top_k || y.E > 512 || y.FF <= 0 || y.FF % 32 != 0) {
+            err = "a geometry this driver's kernels do not take (head 128, conv 4, state 128, head_dim 64, <= 512 experts, "
+                  "top-k <= 32, widths in whole blocks)";
+            return false;
+        }
+        if ((int) tu->shape[0] != g.LAT || (int) td->shape[0] != y.FF || (int) td->shape[1] != g.LAT ||
+            (int) td->shape[2] != y.E || (int) tr->elements() != g.N * y.E || (int) tb->elements() != y.E) {
             err = L(l, "expert tensors have an unexpected shape");
             return false;
         }
-        if (!K::native_expert_ungated_supported((int) tu->type, (int) td->type, g.LAT, g.FF)) {
+        if (!K::native_expert_ungated_supported((int) tu->type, (int) td->type, g.LAT, y.FF)) {
             err = L(l, "experts are ") + tu->type_name() + "/" + td->type_name() +
                   ", which the native expert kernels do not take";
             return false;
         }
-        y.L = K::native_expert_layout_ungated((int) tu->type, (int) td->type, g.LAT, g.FF);
+        y.L = K::native_expert_layout_ungated((int) tu->type, (int) td->type, g.LAT, y.FF);
         y.stride = (y.L.bytes + 255) / 256 * 256;
-        y.up_bytes = (size_t) g.FF * y.L.gu_row;
+        y.up_bytes = (size_t) y.FF * y.L.gu_row;
         y.d_bytes = (size_t) g.LAT * y.L.d_row;
         y.src_up = gm.shard(su).tensor_data(*tu);
         y.src_down = gm.shard(sd).tensor_data(*td);
-        if (!strata::nemotron_h::cpu_fmt((int) tu->type, (int) td->type, g.LAT, g.FF, y.fmt, err)) return false;
+        if (!strata::nemotron_h::cpu_fmt((int) tu->type, (int) td->type, g.LAT, y.FF, y.fmt, err)) return false;
         if (y.fmt.up_row != y.L.gu_row || y.fmt.d_row != y.L.d_row) {
             err = "the CPU and GPU expert row sizes differ";
             return false;
         }
+        g.E = std::max(g.E, y.E);
+        g.FF = std::max(g.FF, y.FF);
         return true;
     };
     m.layers.resize((size_t) g.n_layers);
@@ -427,7 +541,7 @@ struct ExpertStream {
         slot = slot_bytes;
         CK(cudaMalloc(&ring, (size_t) nr * slot + kTail));
         CK(cudaMemset(ring, 0, (size_t) nr * slot + kTail));
-        if (!registered) CK(cudaHostAlloc((void**) &bounce, (size_t) nr * slot, cudaHostAllocDefault));
+        if (!registered) init_bounce();
         CK(cudaStreamCreateWithFlags(&cst, cudaStreamNonBlocking));
         ready.resize((size_t) nr);
         freed.resize((size_t) nr);
@@ -435,6 +549,9 @@ struct ExpertStream {
             CK(cudaEventCreateWithFlags(&ready[(size_t) i], cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&freed[(size_t) i], cudaEventDisableTiming));
         }
+    }
+    void init_bounce() {
+        if (!bounce) CK(cudaHostAlloc((void**) &bounce, (size_t) nr * slot, cudaHostAllocDefault));
     }
     void begin(std::vector<Item> items) {
         finish();
@@ -487,6 +604,15 @@ struct ExpertStream {
         CK(cudaStreamWaitEvent(st, ready[(size_t) s], 0));
         return ring + (size_t) s * slot;
     }
+    /// Same host wait as take(), but no stream wait.  The prompt MMQ copier waits for ready[] on its own stream.
+    const uint8_t* pointer(long i) {
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, [&] { return enq.load() > i; });
+        }
+        return ring + (size_t) (i % nr) * slot;
+    }
+    int slot_index(long i) const { return (int) (i % nr); }
     void done(long i, cudaStream_t st) {
         CK(cudaEventRecord(freed[(size_t) (i % nr)], st));
         {
@@ -521,6 +647,62 @@ template <class T> T* dalloc_t(size_t n) {
     return p;
 }
 
+/// DFlash's target features: rows of the residual into their column block of the [rows, ld] FP16 matrix
+__global__ void k_feat16(const float* __restrict__ x, int N, __half* __restrict__ dst, int ld) {
+    const float* r = x + (size_t) blockIdx.x * N;
+    __half* d = dst + (size_t) blockIdx.x * ld;
+    for (int i = threadIdx.x; i < N; i += blockDim.x) d[i] = __float2half(r[i]);
+}
+
+/// STRATA_NH_PROF=1: cuda events on the prompt stream, resolved once per forward.  Off for speed runs.
+struct Prof {
+    enum Ph { MambaIn, MambaConv, MambaScan, MambaGate, MambaOut, AddNorm, Attn, MoePre, MoeShared, MoeExperts, MoeLat, Other, NPh };
+    static constexpr int kMax = 1024;
+    bool on = false;
+    cudaEvent_t ev[kMax]{};
+    int phase[kMax]{};
+    int n = 0;
+    static const char* name(int p) {
+        static const char* nm[NPh] = {"mamba_in", "mamba_conv", "mamba_scan", "mamba_gate", "mamba_out", "add_norm",
+                                      "attn", "moe_pre", "moe_shared", "moe_experts", "moe_lat", "other"};
+        return nm[p];
+    }
+    void init() {
+        const char* e = std::getenv("STRATA_NH_PROF");
+        on = e != nullptr && std::strcmp(e, "1") == 0;
+        if (!on) return;
+        for (int i = 0; i < kMax; ++i) CK(cudaEventCreate(&ev[i]));
+    }
+    void begin(cudaStream_t st) {
+        if (!on) return;
+        CK(cudaEventRecord(ev[0], st));
+        n = 1;
+    }
+    void mark(cudaStream_t st, int ph) {
+        if (!on || n <= 0 || n >= kMax) return;
+        phase[n] = ph;
+        CK(cudaEventRecord(ev[n], st));
+        ++n;
+    }
+    void finish() {
+        if (!on || n < 2) { n = 0; return; }
+        CK(cudaEventSynchronize(ev[n - 1]));
+        double local[NPh] = {};
+        double sum = 0;
+        for (int i = 1; i < n; ++i) {
+            float t = 0;
+            CK(cudaEventElapsedTime(&t, ev[i - 1], ev[i]));
+            local[phase[i]] += (double) t;
+            sum += (double) t;
+        }
+        n = 0;
+        std::fprintf(stderr, "strata-nh: prof");
+        for (int i = 0; i < NPh; ++i)
+            if (local[i] >= 0.05) std::fprintf(stderr, " %s %.1f", name(i), local[i]);
+        std::fprintf(stderr, " (%.1f ms)\n", sum);
+    }
+};
+
 struct Engine {
     const Model* m = nullptr;
     cudaStream_t st = nullptr;
@@ -548,10 +730,20 @@ struct Engine {
     std::vector<__half*> kc, vc;         // per attention layer (+ the MTP block's at n_attn)
     strata::prefill::Gemm gemm;
     cublasHandle_t blas = nullptr;
+    SsmWs ssm_ws;
     static constexpr int kSplitK = 16;
     float* sk_part = nullptr;
     int mtp_d = 0;
     bool prompt_mtp = true;   // the prompt also runs through the MTP block (its KV) when drafts are on
+    // ---- DFlash (--dflash GGUF): the drafter reads the residual entering its target sublayers, FP16, the last
+    // kFeatRows rows of a forward (its KV ring holds no more), and drafts df_d tokens a step
+    std::unique_ptr<strata::nemotron_h::DFlashDrafter> df;
+    int df_d = 0, df_ntgt = 0;
+    std::vector<int> df_col;   // per sublayer: its column block in feat16 (-1: not a target)
+    __half* feat16 = nullptr;
+    static constexpr int kFeatRows = 1024;
+    double df_ms = 0;          // drafting time (the drafter's own clock), summed
+    long long df_steps = 0;
     // the hybrid mode
     struct Hy {
         std::vector<int> slot_of, exp_in_slot;
@@ -591,6 +783,7 @@ struct Engine {
         int64_t pos = 0;           // the tokens it holds: live[0 .. pos)
         float* host = nullptr;
         uint64_t used = 0;
+        std::vector<uint8_t> df_state;   // the DFlash drafter's KV ring and anchor at pos
     };
     std::vector<Ckpt> ckpts;
     int max_ckpts = 4;
@@ -639,6 +832,10 @@ struct Engine {
         c->pos = pos;
         c->used = ++ckpt_clock;
         ckpt_copy(c->host, true);
+        if (df) {
+            c->df_state.resize(df->state_bytes());
+            df->copy_state(c->df_state.data(), true, st);
+        }
     }
     /// The checkpoints past `keep` tokens no longer describe the live sequence (its cells were rewritten from there).
     void ckpt_drop_past(int64_t keep) {
@@ -650,6 +847,10 @@ struct Engine {
         for (Ckpt& k : ckpts) if (k.pos > 0 && k.pos <= limit && (!best || k.pos > best->pos)) best = &k;
         if (!best) return 0;
         ckpt_copy(best->host, false);
+        if (df) {
+            if (best->df_state.size() == df->state_bytes()) df->copy_state(best->df_state.data(), false, st);
+            else df->reset();
+        }
         best->used = ++ckpt_clock;
         pos = best->pos;
         return pos;
@@ -676,8 +877,9 @@ struct Engine {
     /// read by prefetch_issue once that sublayer's kernels are queued too.
     void prefetch_begin(const Layer& Ln, int T) {
         const Geo& g = m->g;
-        f32mm(Ln.moe.router, h, logits_pf, g.N, g.E, T);
-        k_route<<<T, 512, 0, st>>>(logits_pf, Ln.moe.bias, g.E, g.top_k, g.w_scale, g.w_norm, ids_pf, wts_pf);
+        const int E_ = Ln.moe.E;
+        f32mm(Ln.moe.router, h, logits_pf, g.N, E_, T);
+        k_route<<<T, 512, 0, st>>>(logits_pf, Ln.moe.bias, E_, g.top_k, g.w_scale, g.w_norm, ids_pf, wts_pf);
         CK(cudaMemcpyAsync(h_pfids, ids_pf, (size_t) T * g.top_k * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaEventRecord(ev_pfroute, st));
     }
@@ -687,7 +889,7 @@ struct Engine {
         const int mi = Ln.idx, b = mi & 1;
         CK(cudaEventSynchronize(ev_pfroute));
         Pf& P = pf[b];
-        for (int x = 0; x < g.E; ++x) P.slot[(size_t) x] = -1;
+        for (int x = 0; x < M.E; ++x) P.slot[(size_t) x] = -1;
         P.mi = mi;
         const Hy& Hh = hy[(size_t) mi];
         CK(cudaStreamWaitEvent(cst2, ev_pffree[b], 0));
@@ -715,11 +917,41 @@ struct Engine {
     cudaEvent_t ev_route = nullptr;
     ExpertStream xs;
     long xs_pos = 0;
+#if defined(STRATA_PREFILL_MMQ)
+    // Prompt chunks (T > hybrid_t): one MMQ launch per group of experts, weights read as IQ2_XXS.  STRATA_NH_EXPERT_MMQ=0
+    // keeps the per-expert FP16 GEMMs.  The group buffers are allocated here, before place_experts sizes the slots.
+    static constexpr int kMmqGroup = 32;
+    static constexpr int kMmqIdPad = 160;   // MMQ reads up to J (<= 128) ids past the last row
+    static constexpr int kMmqHold = 96;     // streamed experts held until a flush; capped again by the ring
+    bool mmq_on = false;
+    std::vector<char> mmq_ok;               // per MoE slot (main layers, then the MTP block)
+    std::unique_ptr<MMQ::Context> mmq_ctx;
+    uint8_t* mmq_up_b[2] = {};
+    uint8_t* mmq_dn_b[2] = {};
+    void* mmq_xq = nullptr;
+    int32_t* mmq_ids = nullptr;
+    int32_t* mmq_bounds_b[2] = {};
+    const uint8_t** mmq_ptrs_b[2] = {};
+    int mmq_rows_cap = 0;
+    size_t mmq_max_bytes = 0;
+    cudaEvent_t ev_moe_route = nullptr, ev_moe_cnt = nullptr;
+    cudaStream_t cst_cp = nullptr;                 // copies the next expert group while st multiplies the previous one
+    cudaEvent_t ev_cp[2] = {}, ev_mmq_done[2] = {};
+    bool mmq_buf_live[2] = {};
+    int mmq_buf = 0;
+#endif
     long long hy_cpu = 0, hy_gpu = 0, hy_swaps = 0, hy_streamed = 0;
     double hy_cpu_ms = 0;
     bool warming = false;
+    Prof prof;
     int adapt_every = 32, adapt_swaps = 8;   // --adapt-every / --adapt-swaps: the decode's slot replacements
     int swaps_after_prompt = 512;
+    // POST /v1/vram (the server's `VRAM <reserve_mib>`): the startup slot count is the ceiling.  A shrink frees
+    // slots, a regrow refills them up to that ceiling.  Dense weights, the KV cache and vram_reserve_mib stay.
+    int vram_reserve_mib = 1024;
+    int slots_cap = 0, slots_now = 0;
+    int prompt_chunk = 2048;
+    std::vector<Moe*> vram_moe;
     // GENI: rows that replace the embedding of an absolute position (host floats, N each)
     std::map<int64_t, const float*> inject;
     // --dump-layers: every main forward's sublayer outputs (the residual x), [pos][layer][N] f32 (parity.py)
@@ -734,7 +966,7 @@ struct Engine {
         std::exit(1);
     }
 
-    void init(const Model& model, int ctx_, int tmax_) {
+    void init(const Model& model, int ctx_, int tmax_, int ring) {
         m = &model;
         ctx = ctx_;
         tmax = std::max(tmax_, kVerify);
@@ -742,13 +974,16 @@ struct Engine {
         const size_t T = (size_t) tmax, N = (size_t) g.N, Kp = (size_t) g.top_k;
         CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
         x = dalloc(T * N); h = dalloc(T * N); y = dalloc(T * N); y2 = dalloc(T * N);
-        hmain = dalloc(T * N); hlast = dalloc(N); seeds = dalloc(T * N); hmtp = dalloc(T * N);
-        mtp_cat = dalloc(T * 2 * N);
+        hmain = dalloc(T * N); hlast = dalloc(N);
+        if (m->has_mtp) {
+            seeds = dalloc(T * N); hmtp = dalloc(T * N); mtp_cat = dalloc(T * 2 * N);
+        }
         zx = dalloc(T * g.in_proj); xc = dalloc(T * g.conv_ch); yr = dalloc(T * g.ssm_inner); yg = dalloc(T * g.ssm_inner);
         qx = dalloc(T * g.H * kHD); kx = dalloc(T * g.HKV * kHD); vx = dalloc(T * g.HKV * kHD); att = dalloc(T * g.H * kHD);
         logits_r = dalloc(T * g.E); ewts = dalloc(T * Kp);
         hl = dalloc(T * g.LAT); lat = dalloc(T * g.LAT); eparts = dalloc(T * Kp * g.LAT); su = dalloc(T * g.FS);
-        logits = dalloc((size_t) kVerify * g.V); logits_m = dalloc((size_t) g.V);
+        logits = dalloc((size_t) kVerify * g.V);
+        if (m->has_mtp) logits_m = dalloc((size_t) g.V);
         ubuf = dalloc(T * g.FF);
         const int max_in = std::max({2 * g.N, g.ssm_inner, g.H * kHD, g.FS, g.LAT});
         CK(cudaMalloc(&q8, K::native_q8_1_bytes(max_in, 1) * T));
@@ -758,7 +993,10 @@ struct Engine {
         xg16 = dalloc_t<__half>(T * Kp * g.LAT);
         hb16 = dalloc_t<__half>(T * g.FF);
         q16 = dalloc_t<__half>(T * g.H * kHD);
-        if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(blas, st) != CUBLAS_STATUS_SUCCESS) {
+        void* blas_ws = nullptr;
+        CK(cudaMalloc(&blas_ws, (size_t) 8 << 20));
+        if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(blas, st) != CUBLAS_STATUS_SUCCESS ||
+            cublasSetWorkspace(blas, blas_ws, (size_t) 8 << 20) != CUBLAS_STATUS_SUCCESS) {
             std::fprintf(stderr, "strata-nh: cuBLAS handle failed\n");
             std::exit(1);
         }
@@ -782,6 +1020,12 @@ struct Engine {
                 std::fprintf(stderr, "strata-nh: prompt GEMM: %s\n", gerr.c_str());
                 std::exit(1);
             }
+            // touch both cuBLAS handles' FP16 GEMM paths now so their kernel modules are loaded before VRAM sizing
+            gemm.f16((const uint16_t*) x16, (const uint16_t*) x16, y, 16, 64, 64, 64);
+            const float one = 1.0f, zero = 0.0f;
+            (void) cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, 64, 16, kHD, &one, x16, CUDA_R_16F, kHD, 0,
+                                              q16, CUDA_R_16F, kHD, kHD, &zero, att_s, CUDA_R_32F, 64, 1024, 1,
+                                              CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
         }
         // the grouped kernels' scratch for a rows batch (at most hybrid_t rows: a bigger batch streams)
         const size_t rows_cap = (size_t) std::max(std::min(hybrid_t, tmax), kVerify);
@@ -799,9 +1043,11 @@ struct Engine {
         tok = dalloc_t<int32_t>(T);
         pos0 = dalloc_t<int32_t>(1);
         pick = dalloc_t<int32_t>(kVerify);
-        tok_m = dalloc_t<int32_t>(T);
-        pos0_m = dalloc_t<int32_t>(1);
-        pick_m = dalloc_t<int32_t>(1);
+        if (m->has_mtp) {
+            tok_m = dalloc_t<int32_t>(T);
+            pos0_m = dalloc_t<int32_t>(1);
+            pick_m = dalloc_t<int32_t>(1);
+        }
         amv = dalloc((size_t) kArgBlocks * kVerify);
         ami = dalloc_t<int32_t>((size_t) kArgBlocks * kVerify);
         CK(cudaHostAlloc((void**) &hpin, 64 * sizeof(int32_t), cudaHostAllocDefault));
@@ -820,11 +1066,37 @@ struct Engine {
             kc.push_back(dalloc_t<__half>((size_t) g.HKV * ctx * kHD));
             vc.push_back(dalloc_t<__half>((size_t) g.HKV * ctx * kHD));
         }
+        size_t max_stride = 0;
+        for (const Layer& L : m->layers)
+            if (L.kind == Kind::Moe) max_stride = std::max(max_stride, L.moe.stride);
+        if (m->has_mtp) max_stride = std::max(max_stride, m->mtp_moe.moe.stride);
+        xs.dev = 0;
+        CK(cudaGetDevice(&xs.dev));
+        xs.init(std::max(4, ring), max_stride, true);
+        tr_stride = max_stride;
+        if (pcie_frac <= 0.f) pcie_cap = 0;   // the share off: no buffer (its VRAM goes to the slots)
+        if (pcie_cap > 0) pcbuf = dalloc_t<uint8_t>((size_t) pcie_cap * max_stride + kTail);
+        if (pf_cap > 0)
+            for (int b = 0; b < 2; ++b) pfbuf[b] = dalloc_t<uint8_t>((size_t) pf_cap * max_stride + kTail);
+        CK(cudaHostAlloc((void**) &h_hl, T * g.LAT * 4, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void**) &cpu_out, T * Kp * g.LAT * 4, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void**) &h_ids, T * Kp * 4, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void**) &h_miss, T * Kp * 4, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void**) &h_cnt, (size_t) g.E * 4, cudaHostAllocDefault));
+        ecpu = dalloc(T * Kp * g.LAT);
+        d_miss = dalloc_t<int32_t>(T * Kp);
+        init_transient();
+        if (tmax > kSsmSsdMinTok) ssm_ws_reserve(ssm_ws, g.ssm_H, kSsmP, kSsmN, g.ssm_G, tmax);   // the prompt scan's scratch
+#if defined(STRATA_PREFILL_MMQ)
+        init_prompt_mmq();
+#endif
+        prof.init();
+        CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming | cudaEventBlockingSync));
         CK(cudaDeviceSynchronize());
         size_t fr = 0, tot = 0;
-        CK(cudaMemGetInfo(&fr, &tot));
-        std::fprintf(stderr, "strata-nh: context %d cells (FP16 KV, %.2f GiB), prompt chunk %d, %.2f GiB of VRAM free\n",
-                     ctx, (double) kc.size() * 2 * g.HKV * ctx * kHD * 2 / (1 << 30), tmax, (double) fr / (1 << 30));
+        vram_info(fr, tot);
+        std::fprintf(stderr, "strata-nh: context %d cells (FP16 KV, %.2f GiB), prompt chunk %d, %.2f GiB (%zu MiB) of VRAM free\n",
+                     ctx, (double) kc.size() * 2 * g.HKV * ctx * kHD * 2 / (1 << 30), tmax, (double) fr / (1 << 30), fr >> 20);
     }
 
     void reset() {
@@ -836,6 +1108,7 @@ struct Engine {
         CK(cudaMemsetAsync(hlast, 0, (size_t) g.N * 4, st));
         CK(cudaStreamSynchronize(st));
         pos = 0;
+        if (df) df->reset();
     }
 
     // ---- matmuls: a decode batch on the native MMVQ (q8_1 activations), a prompt chunk on FP16 GEMMs
@@ -855,6 +1128,13 @@ struct Engine {
     void apply(const Mat& w, const void* q, float* out, int T) {
         if (T > kGemmT) gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
         else mmq(w, q, out, T);
+        if (w.scale != 1.0f) {
+            const int64_t n = (int64_t) T * w.n_out;
+            if (T > 64 && n % 4 == 0 && (reinterpret_cast<uintptr_t>(out) & 15) == 0)
+                k_scale4<<<grid1(n / 4), kThreads, 0, st>>>(out, w.scale, n / 4);
+            else
+                k_scale<<<grid1(n), kThreads, 0, st>>>(out, w.scale, n);
+        }
     }
     void mm(const Mat& w, const float* xin, float* out, int T) {
         prep(xin, w.n_in, T, q8);
@@ -863,7 +1143,7 @@ struct Engine {
     /// out [T][n_out] = W [n_out][n_in] (f32) x: the router (FP32, as llama.cpp keeps it)
     void f32mm(const float* W, const float* xin, float* out, int n_in, int n_out, int T) {
         if (T <= kGemmT) {
-            k_gemv_f32<<<dim3(rows8(n_out), T), kThreads, 0, st>>>(W, xin, out, n_in, n_out);
+            k_gemv_f32<<<dim3((n_out + 15) / 16, T), 256, 0, st>>>(W, xin, out, n_in, n_out);
             return;
         }
         const int tm = n_out > 64 ? 4 : 1;
@@ -882,17 +1162,30 @@ struct Engine {
         const Geo& g = m->g;
         const int li = L.idx;
         mm(L.ssm_in, h, zx, T);   // [T][z 8192 | xBC 10240 | dt 128]
+        prof.mark(st, Prof::MambaIn);
         const int vcols = g.in_proj - g.ssm_inner;
         if (verify)   // the window's xBC | dt rows, for the commit
             CK(cudaMemcpy2DAsync(vbuf[(size_t) li], (size_t) vcols * 4, zx + g.ssm_inner, (size_t) g.in_proj * 4,
                                  (size_t) vcols * 4, (size_t) T, cudaMemcpyDeviceToDevice, st));
-        k_conv<<<grid1(g.conv_ch, 128), 128, 0, st>>>(conv[(size_t) li], zx + g.ssm_inner, g.in_proj, L.conv_w, L.conv_b, xc,
-                                                      g.conv_ch, T, !verify);
-        k_ssm<<<g.ssm_H, 256, 0, st>>>(S[(size_t) li], xc, g.conv_ch, zx + g.ssm_inner + g.conv_ch, g.in_proj, L.dt_b, L.A,
-                                       L.D, yr, g.ssm_H, g.ssm_G, T, !verify);
+        if (T > 64) {
+            k_conv_prompt<64><<<dim3(grid1(g.conv_ch, 128), (unsigned) ((T + 63) / 64)), 128, 0, st>>>(
+                conv[(size_t) li], zx + g.ssm_inner, g.in_proj, L.conv_w, L.conv_b, xc, g.conv_ch, T);
+            if (!verify)
+                k_conv_save_hist<<<grid1(g.conv_ch, 128), 128, 0, st>>>(conv[(size_t) li], zx + g.ssm_inner, g.in_proj,
+                                                                       g.conv_ch, T);
+        } else {
+            k_conv<<<grid1(g.conv_ch, 128), 128, 0, st>>>(conv[(size_t) li], zx + g.ssm_inner, g.in_proj, L.conv_w, L.conv_b,
+                                                          xc, g.conv_ch, T, !verify);
+        }
+        prof.mark(st, Prof::MambaConv);
+        ssm_scan(S[(size_t) li], xc, g.conv_ch, zx + g.ssm_inner + g.conv_ch, g.in_proj, L.dt_b, L.A, L.D, yr, g.ssm_H,
+                 g.ssm_G, kSsmP, kSsmN, T, !verify, ssm_ws, st, blas);
+        prof.mark(st, Prof::MambaScan);
         k_gate_norm<<<dim3(g.ssm_G, T), kThreads, 0, st>>>(yr, zx, g.in_proj, L.ssm_norm, yg, g.ssm_inner,
                                                            g.ssm_inner / g.ssm_G, g.eps);
+        prof.mark(st, Prof::MambaGate);
         mm(L.ssm_out, yg, y, T);
+        prof.mark(st, Prof::MambaOut);
     }
 
     void attention(const Layer& L, int T, int64_t p0, const int32_t* dpos) {
@@ -954,16 +1247,243 @@ struct Engine {
         mm(L.wo, att, y, T);
     }
 
+#if defined(STRATA_PREFILL_MMQ)
+    /// Which layers can take the grouped IQ MMQ path (type, tile, byte layout).  A layer that fails stays on the
+    /// per-expert FP16 GEMMs.
+    void init_prompt_mmq() {
+        const char* env = std::getenv("STRATA_NH_EXPERT_MMQ");
+        const bool force_off = env != nullptr && std::strcmp(env, "0") == 0;
+        const Geo& g = m->g;
+        const int nmoe = m->n_moe + (m->has_mtp ? 1 : 0);
+        mmq_ok.assign((size_t) nmoe, 0);
+        if (!force_off && MMQ::built()) {
+            auto ok = [&](const Moe& M) {
+                if (!MMQ::supported(M.L.gu_type) || !MMQ::supported(M.L.d_type)) return false;
+                if (!MMQ::fits(M.L.gu_type, M.FF) || !MMQ::fits(M.L.d_type, g.LAT)) return false;
+                if (MMQ::matrix_bytes(M.L.gu_type, M.FF, g.LAT) != M.up_bytes) return false;
+                if (MMQ::matrix_bytes(M.L.d_type, g.LAT, M.FF) != M.d_bytes) return false;
+                if (((M.up_bytes | M.d_bytes | M.L.down_off) & 15) != 0) return false;
+                if (M.L.down_off != M.up_bytes || M.up_bytes == 0) return false;
+                return true;
+            };
+            for (const Layer& L : m->layers)
+                if (L.kind == Kind::Moe && ok(L.moe)) mmq_ok[(size_t) L.idx] = 1;
+            if (m->has_mtp && ok(m->mtp_moe.moe)) mmq_ok[(size_t) m->n_moe] = 1;
+            for (char c : mmq_ok)
+                if (c) mmq_on = true;
+        }
+        int n_ok = 0;
+        for (char c : mmq_ok) n_ok += c != 0;
+        if (!mmq_on) {
+            std::fprintf(stderr, "strata-nh: prompt MoE: per-expert FP16 GEMM\n");
+            return;
+        }
+        mmq_rows_cap = tmax;
+        for (const Layer& L : m->layers)
+            if (L.kind == Kind::Moe && mmq_ok[(size_t) L.idx])
+                mmq_max_bytes = std::max(mmq_max_bytes, std::max(L.moe.up_bytes, L.moe.d_bytes));
+        if (m->has_mtp && mmq_ok[(size_t) m->n_moe])
+            mmq_max_bytes = std::max(mmq_max_bytes, std::max(m->mtp_moe.moe.up_bytes, m->mtp_moe.moe.d_bytes));
+        const size_t wbytes = (size_t) kMmqGroup * mmq_max_bytes + kTail;
+        for (int b = 0; b < 2; ++b) {
+            CK(cudaMalloc(&mmq_up_b[b], wbytes));
+            CK(cudaMalloc(&mmq_dn_b[b], wbytes));
+            mmq_bounds_b[b] = dalloc_t<int32_t>((size_t) kMmqGroup + 1);
+            void* pptrs = nullptr;
+            CK(cudaMalloc(&pptrs, (size_t) kMmqGroup * sizeof(void*)));
+            mmq_ptrs_b[b] = static_cast<const uint8_t**>(pptrs);
+            CK(cudaEventCreateWithFlags(&ev_cp[b], cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&ev_mmq_done[b], cudaEventDisableTiming));
+        }
+        CK(cudaStreamCreateWithFlags(&cst_cp, cudaStreamNonBlocking));
+        CK(cudaMalloc(&mmq_xq, MMQ::q8_bytes(mmq_rows_cap, g.FF)));
+        mmq_ids = dalloc_t<int32_t>((size_t) mmq_rows_cap + kMmqIdPad);
+        CK(cudaEventCreateWithFlags(&ev_moe_route, cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&ev_moe_cnt, cudaEventDisableTiming));
+        mmq_ctx = std::make_unique<MMQ::Context>();
+        CK(cudaDeviceSynchronize());   // dalloc's legacy-stream memsets before iota on st
+        MMQ::iota(mmq_ids, (int64_t) mmq_rows_cap + kMmqIdPad, st);
+        std::fprintf(stderr,
+                     "strata-nh: prompt MoE: grouped IQ MMQ (%d experts, weights stay quantized, copies double-buffered) on %d/%d MoE layers\n",
+                     kMmqGroup, n_ok, nmoe);
+    }
+
+    /// T > hybrid_t, one MoE layer: route counts come back on cst2 while the shared expert runs on st, then experts
+    /// with rows are grouped (at most kMmqGroup, and at most mmq_rows_cap rows).  Both matrices are copied out of the
+    /// ring slot before done(), so the next uploads overlap the multiply.  Down writes sorted rows of eparts.
+    void moe_stream_mmq(const Moe& M, int mi, int T) {
+        const Geo& g = m->g;
+        const int LAT = g.LAT, FF = M.FF, E_ = M.E;
+        const int n_ent = T * g.top_k;
+        Hy& Hh = hy[(size_t) mi];
+        CK(cudaEventRecord(ev_moe_route, st));
+        CK(cudaStreamWaitEvent(cst2, ev_moe_route, 0));
+        CK(cudaMemcpyAsync(h_cnt, rcnt, (size_t) E_ * 4, cudaMemcpyDeviceToHost, cst2));
+        CK(cudaEventRecord(ev_moe_cnt, cst2));
+        shared(M, T);   // hides the count copy; y2 is independent of the routed experts
+        prof.mark(st, Prof::MoeShared);
+        CK(cudaEventSynchronize(ev_moe_cnt));
+
+        struct Exp {
+            const uint8_t* w;
+            int c;
+            long item;
+        };
+        Exp grp[kMmqGroup];
+        long pend[kMmqHold];
+        int ng = 0, np = 0, grows = 0, row0 = 0;
+        const int hold_lim = std::max(1, std::min(kMmqHold, xs.nr - 1));
+
+        auto flush = [&]() {
+            if (ng > 0) {
+                const uint8_t* hp[kMmqGroup];
+                int32_t hb[kMmqGroup + 1];
+                hb[0] = 0;
+                int rows = 0, mr = 0;
+                for (int i = 0; i < ng; ++i) {
+                    hp[i] = grp[i].w;
+                    rows += grp[i].c;
+                    hb[i + 1] = rows;
+                    if (grp[i].c > mr) mr = grp[i].c;
+                }
+                static_assert(kMmqGroup <= kMmqStage, "stage pack holds one group");
+                MmqStage stage{};
+                stage.n = ng;
+                for (int i = 0; i < ng; ++i) {
+                    stage.ptr[i] = hp[i];
+                    stage.bounds[i] = hb[i];
+                }
+                stage.bounds[ng] = hb[ng];
+                // Copies land in buffer b on cst_cp.  st waits for ev_cp[b] before the multiply, and the next user
+                // of b waits for ev_mmq_done[b] first, so the multiply still owns the buffer.  done() is recorded on
+                // cst_cp after that wait and the copy, or the ring would reuse a slot whose upload is still in flight.
+                const int b = mmq_buf;
+                if (mmq_buf_live[b]) CK(cudaStreamWaitEvent(cst_cp, ev_mmq_done[b], 0));
+                for (int i = 0; i < np; ++i)
+                    CK(cudaStreamWaitEvent(cst_cp, xs.ready[(size_t) xs.slot_index(pend[i])], 0));
+                k_stage_mmq<<<1, kMmqGroup + 1, 0, cst_cp>>>(stage, mmq_ptrs_b[b], mmq_bounds_b[b]);
+                const int n4u = (int) (M.up_bytes / 16);
+                const int n4d = (int) (M.d_bytes / 16);
+                auto launch_copy = [&](int src_off, uint8_t* dst, int n4) {
+                    const unsigned gx = (unsigned) std::max(1, std::min(128, (n4 + kThreads - 1) / kThreads));
+                    k_copy_experts<<<dim3(gx, (unsigned) ng), kThreads, 0, cst_cp>>>(mmq_ptrs_b[b], src_off,
+                                                                                     reinterpret_cast<uint4*>(dst), n4, n4);
+                };
+                launch_copy(0, mmq_up_b[b], n4u);
+                launch_copy((int) M.L.down_off, mmq_dn_b[b], n4d);
+                CK(cudaMemsetAsync(mmq_up_b[b] + (size_t) ng * M.up_bytes, 0, kTail, cst_cp));
+                CK(cudaMemsetAsync(mmq_dn_b[b] + (size_t) ng * M.d_bytes, 0, kTail, cst_cp));
+                CK(cudaEventRecord(ev_cp[b], cst_cp));
+                for (int i = 0; i < np; ++i) xs.done(pend[i], cst_cp);
+                np = 0;
+                CK(cudaGetLastError());
+
+                MMQ::quantize(hl, ent_tok + row0, mmq_xq, M.L.gu_type, LAT, LAT, rows, st);
+                CK(cudaStreamWaitEvent(st, ev_cp[b], 0));
+                CK(cudaMemsetAsync(ubuf, 0, (size_t) rows * (size_t) FF * 4, st));
+                MMQ::Product up;
+                up.w = mmq_up_b[b];
+                up.type = M.L.gu_type;
+                up.w_rows = FF;
+                up.w_cols = LAT;
+                up.expert_bytes = M.up_bytes;
+                up.n = ng;
+                up.xq = mmq_xq;
+                up.bounds = mmq_bounds_b[b];
+                up.ids = mmq_ids;
+                up.total_rows = rows;
+                up.max_rows = mr;
+                up.dst = ubuf;
+                up.ld_dst = FF;
+                mmq_ctx->run(up, st);
+                k_relu2<<<grid1((int64_t) rows * FF), kThreads, 0, st>>>(ubuf, (int64_t) rows * FF);
+                MMQ::quantize(ubuf, nullptr, mmq_xq, M.L.d_type, FF, FF, rows, st);
+                CK(cudaMemsetAsync(eparts + (size_t) row0 * LAT, 0, (size_t) rows * (size_t) LAT * 4, st));
+                MMQ::Product dn;
+                dn.w = mmq_dn_b[b];
+                dn.type = M.L.d_type;
+                dn.w_rows = LAT;
+                dn.w_cols = FF;
+                dn.expert_bytes = M.d_bytes;
+                dn.n = ng;
+                dn.xq = mmq_xq;
+                dn.bounds = mmq_bounds_b[b];
+                dn.ids = mmq_ids;
+                dn.total_rows = rows;
+                dn.max_rows = mr;
+                dn.dst = eparts + (size_t) row0 * LAT;
+                dn.ld_dst = LAT;
+                mmq_ctx->run(dn, st);
+                CK(cudaEventRecord(ev_mmq_done[b], st));
+                mmq_buf_live[b] = true;
+                mmq_buf ^= 1;
+                row0 += rows;
+                ng = 0;
+                grows = 0;
+            } else if (np > 0) {
+                for (int i = 0; i < np; ++i) {
+                    CK(cudaStreamWaitEvent(cst_cp, xs.ready[(size_t) xs.slot_index(pend[i])], 0));
+                    xs.done(pend[i], cst_cp);
+                }
+                np = 0;
+            }
+        };
+
+        for (int xid = 0; xid < E_; ++xid) {
+            const int c = h_cnt[xid];
+            if (c > mmq_rows_cap) {
+                std::fprintf(stderr, "strata-nh: expert %d has %d rows, the MMQ group holds %d\n", xid, c, mmq_rows_cap);
+                std::exit(1);
+            }
+            if (!warming) {
+                Hh.score[(size_t) xid] += c;
+                Hh.total[(size_t) xid] += c;
+            }
+            const bool res = Hh.slot_of[(size_t) xid] >= 0;
+            long item = -1;
+            const uint8_t* w = nullptr;
+            if (c <= 0) {
+                if (!res) {
+                    if (np >= hold_lim) flush();
+                    item = xs_pos++;
+                    (void) xs.pointer(item);
+                    ++hy_streamed;
+                    pend[np++] = item;
+                }
+                continue;
+            }
+            if (ng == kMmqGroup || (ng > 0 && grows + c > mmq_rows_cap) || (!res && np >= hold_lim)) flush();
+            if (!res) {
+                item = xs_pos++;
+                w = xs.pointer(item);
+                ++hy_streamed;
+                pend[np++] = item;
+            } else {
+                w = M.slots + (size_t) Hh.slot_of[(size_t) xid] * M.stride;
+            }
+            grp[ng++] = {w, c, item};
+            grows += c;
+        }
+        flush();
+        prof.mark(st, Prof::MoeExperts);
+        if (row0 != n_ent) {
+            std::fprintf(stderr, "strata-nh: MMQ grouped %d rows, expected %d\n", row0, n_ent);
+            std::exit(1);
+        }
+    }
+#endif
+
     /// The MoE block for T rows of h: y = latent_up(sum_k w_k expert_k(latent_down h)), y2 = the shared expert.
     void moe(const Layer& Lr, int T) {
         const Geo& g = m->g;
         const Moe& M = Lr.moe;
-        const int mi = Lr.idx, N = g.N, Kp = g.top_k, LAT = g.LAT, FF = g.FF;
+        const int mi = Lr.idx, N = g.N, Kp = g.top_k, LAT = g.LAT, E_ = M.E, FF = M.FF;
         const int n_ent = T * Kp;
-        f32mm(M.router, h, logits_r, N, g.E, T);
-        k_route<<<T, 512, 0, st>>>(logits_r, M.bias, g.E, Kp, g.w_scale, g.w_norm, ids, ewts);
+        f32mm(M.router, h, logits_r, N, E_, T);
+        k_route<<<T, 512, 0, st>>>(logits_r, M.bias, E_, Kp, g.w_scale, g.w_norm, ids, ewts);
         prep(h, N, T, xq);                     // (h's image serves the latent and the shared expert's up)
         apply(M.lat_down, xq, hl, T);
+        prof.mark(st, Prof::MoePre);
         const int32_t* prow = nullptr;
         if (T <= hybrid_t) {
             // ---- rows: the resident experts on the GPU, the others on the CPU pool, side by side
@@ -972,10 +1492,10 @@ struct Engine {
             CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaMemcpyAsync(h_hl, hl, (size_t) T * LAT * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaEventRecord(ev_route, st));
-            k_group_hy<<<1, kThreads, 0, st>>>(ids, n_ent, Kp, g.E, Hh.slot_of_d, M.slots, M.stride, grp_ptr, grp_start,
-                                               n_groups, ent_dst, ent_tok);
+            k_group_hy<<<1, 512, 0, st>>>(ids, n_ent, Kp, E_, Hh.slot_of_d, M.slots, M.stride, grp_ptr, grp_start,
+                                          n_groups, ent_dst, ent_tok);
             K::native_expert_grouped_relu2(M.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
-                                           std::min<int64_t>(n_ent, g.E), n_ent, xq_l, escr, eparts, st);
+                                           std::min<int64_t>(n_ent, E_), n_ent, xq_l, escr, eparts, st);
             shared(M, T);
             const auto tw = Clock::now();
             CK(cudaEventSynchronize(ev_route));
@@ -1005,7 +1525,7 @@ struct Engine {
                 for (int x : miss_x) if (c[x]++ == 0) distinct.push_back(x);
                 std::stable_sort(distinct.begin(), distinct.end(), [&](int a, int b) { return c[a] > c[b]; });
                 const int want = std::min<int>(pcie_cap, (int) std::lround(pcie_frac * (double) distinct.size()));
-                pc_slot.assign((size_t) g.E, -1);
+                pc_slot.assign((size_t) E_, -1);
                 CK(cudaStreamWaitEvent(cst2, ev_trfree, 0));
                 for (int i = 0; i < want; ++i) {
                     const int x = distinct[(size_t) i];
@@ -1088,16 +1608,22 @@ struct Engine {
         } else {
             // ---- a prompt chunk: the entries sorted by expert, every expert's rows as two FP16 GEMMs, its weights from
             // its slot or from the stream
-            CK(cudaMemsetAsync(rcnt, 0, (size_t) g.E * 4, st));
+            CK(cudaMemsetAsync(rcnt, 0, (size_t) E_ * 4, st));
             k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, n_ent, rcnt);
-            k_route_scan<<<1, 32, 0, st>>>(rcnt, g.E, rbounds, rcur);
+            k_route_scan<<<1, 32, 0, st>>>(rcnt, E_, rbounds, rcur);
             k_route_scatter<<<grid1(n_ent), kThreads, 0, st>>>(ids, n_ent, Kp, rcur, ent_dst, ent_tok, rinv);
+#if defined(STRATA_PREFILL_MMQ)
+            if (mmq_on && mmq_ok[(size_t) mi]) {
+                moe_stream_mmq(M, mi, T);
+            } else
+#endif
+            {
             k_gather_f16<<<grid1((int64_t) n_ent * LAT), kThreads, 0, st>>>(hl, ent_tok, xg16, n_ent, LAT);
-            CK(cudaMemcpyAsync(h_cnt, rcnt, (size_t) g.E * 4, cudaMemcpyDeviceToHost, st));
+            CK(cudaMemcpyAsync(h_cnt, rcnt, (size_t) E_ * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
             Hy& Hh = hy[(size_t) mi];
             int b0 = 0;
-            for (int xid = 0; xid < g.E; ++xid) {
+            for (int xid = 0; xid < E_; ++xid) {
                 const int c = h_cnt[xid];
                 if (!warming) { Hh.score[(size_t) xid] += c; Hh.total[(size_t) xid] += c; }
                 const bool res = Hh.slot_of[(size_t) xid] >= 0;
@@ -1117,11 +1643,15 @@ struct Engine {
                 if (!res) xs.done(item, st);
                 b0 += c;
             }
-            prow = rinv;
+            prof.mark(st, Prof::MoeExperts);
             shared(M, T);
+            prof.mark(st, Prof::MoeShared);
+            }
+            prow = rinv;
         }
         k_combine<<<T, kThreads, 0, st>>>(eparts, prow, ewts, Kp, lat, LAT);
         mm(M.lat_up, lat, y, T);
+        prof.mark(st, Prof::MoeLat);
     }
     /// y2 = down(relu(up h)^2), h's image already in xq / x16 (prep in moe)
     void shared(const Moe& M, int T) {
@@ -1138,7 +1668,7 @@ struct Engine {
         for (int mi : mis) {
             const Moe& M = moe_layer(mi).moe;
             const Hy& Hh = hy[(size_t) mi];
-            for (int xid = 0; xid < m->g.E; ++xid)
+            for (int xid = 0; xid < M.E; ++xid)
                 if (Hh.slot_of[(size_t) xid] < 0)
                     items.push_back({M.up_of(xid), M.down_of(xid), M.up_bytes, M.d_bytes});
         }
@@ -1162,15 +1692,21 @@ struct Engine {
             std::vector<int> mis;
             for (int i = 0; i < m->n_moe; ++i) mis.push_back(i);
             stream_plan(mis);
+            prof.begin(st);
         }
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok, T, N, x, st);
         embed_inject(x, T, p0);
-        k_rms_ld<<<T, kThreads, 0, st>>>(x, N, m->layers[0].norm, h, N, N, g.eps);
+        k_rms_ld<<<T, kNormThreads, 0, st>>>(x, N, m->layers[0].norm, h, N, N, g.eps);
+        prof.mark(st, Prof::Other);
         const size_t nl = m->layers.size();
         if (dump_f) dump_buf.assign(nl * (size_t) T * N, 0.f);
         for (size_t l = 0; l < m->layers.size(); ++l) {
             const Layer& L = m->layers[l];
             const bool last = l + 1 == m->layers.size();
+            if (feat16 && df_col[l] >= 0) {
+                const int R = std::min(T, kFeatRows);
+                k_feat16<<<R, 256, 0, st>>>(x + (size_t) (T - R) * N, N, feat16 + (size_t) df_col[l] * N, df_ntgt * N);
+            }
             const float* wn = last ? m->out_norm : m->layers[l + 1].norm;
             float* hout = last ? hmain : h;
             // the prefetch: the next sublayer is a MoE block in the rows path -> guess its experts now, upload them while
@@ -1180,15 +1716,19 @@ struct Engine {
             if (pfn) prefetch_begin(m->layers[l + 1], T);
             if (L.kind == Kind::Mamba) {
                 mamba(L, T, verify);
-                k_add_norm<<<T, kThreads, 0, st>>>(x, y, nullptr, wn, hout, N, g.eps, false);
+                k_add_norm<<<T, kNormThreads, 0, st>>>(x, y, nullptr, wn, hout, N, g.eps, false);
+                prof.mark(st, Prof::AddNorm);
                 if (pfn) prefetch_issue(m->layers[l + 1], T);
             } else if (L.kind == Kind::Attn) {
                 attention(L, T, p0, pos0);
-                k_add_norm<<<T, kThreads, 0, st>>>(x, y, nullptr, wn, hout, N, g.eps, false);
+                prof.mark(st, Prof::Attn);
+                k_add_norm<<<T, kNormThreads, 0, st>>>(x, y, nullptr, wn, hout, N, g.eps, false);
+                prof.mark(st, Prof::AddNorm);
                 if (pfn) prefetch_issue(m->layers[l + 1], T);
             } else {
                 moe(L, T);
-                k_add_norm<<<T, kThreads, 0, st>>>(x, y, y2, wn, hout, N, g.eps, false);
+                k_add_norm<<<T, kNormThreads, 0, st>>>(x, y, y2, wn, hout, N, g.eps, false);
+                prof.mark(st, Prof::AddNorm);
             }
             if (dump_f)
                 CK(cudaMemcpyAsync(dump_buf.data() + l * (size_t) T * N, x, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
@@ -1199,7 +1739,11 @@ struct Engine {
                 for (size_t l = 0; l < nl; ++l) std::fwrite(dump_buf.data() + (l * (size_t) T + t) * N, 4, (size_t) N, dump_f);
         }
         if (T > hybrid_t) xs.finish();
-        if (heads > 0) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
+        if (heads > 0) {
+            head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
+            prof.mark(st, Prof::Other);
+        }
+        if (T > hybrid_t) prof.finish();
     }
     void head_rows(const float* hn, int n, float* lg, int32_t* pk) {
         mm(m->head, hn, lg, n);
@@ -1215,14 +1759,14 @@ struct Engine {
         if (T > hybrid_t) stream_plan({m->n_moe});
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok_m, T, N, y, st);
         embed_inject(y, T, p0);
-        k_rms_ld<<<T, kThreads, 0, st>>>(y, N, m->mtp_enorm, mtp_cat, 2 * N, N, g.eps);        // [e | ...]
-        k_rms_ld<<<T, kThreads, 0, st>>>(sd, N, m->mtp_hnorm, mtp_cat + N, 2 * N, N, g.eps);   // [... | h]
+        k_rms_ld<<<T, kNormThreads, 0, st>>>(y, N, m->mtp_enorm, mtp_cat, 2 * N, N, g.eps);        // [e | ...]
+        k_rms_ld<<<T, kNormThreads, 0, st>>>(sd, N, m->mtp_hnorm, mtp_cat + N, 2 * N, N, g.eps);   // [... | h]
         mm(m->eh_proj, mtp_cat, x, T);
-        k_rms_ld<<<T, kThreads, 0, st>>>(x, N, m->mtp_attn.norm, h, N, N, g.eps);
+        k_rms_ld<<<T, kNormThreads, 0, st>>>(x, N, m->mtp_attn.norm, h, N, N, g.eps);
         attention(m->mtp_attn, T, p0, pos0_m);
-        k_add_norm<<<T, kThreads, 0, st>>>(x, y, nullptr, m->mtp_post_norm, h, N, g.eps, false);
+        k_add_norm<<<T, kNormThreads, 0, st>>>(x, y, nullptr, m->mtp_post_norm, h, N, g.eps, false);
         moe(m->mtp_moe, T);
-        k_add_norm<<<T, kThreads, 0, st>>>(x, y, y2, m->mtp_shnorm, hmtp, N, g.eps, true);
+        k_add_norm<<<T, kNormThreads, 0, st>>>(x, y, y2, m->mtp_shnorm, hmtp, N, g.eps, true);
         if (T > hybrid_t) xs.finish();
         if (draft) head_rows(hmtp + (size_t) (T - 1) * N, 1, logits_m, pick_m);
     }
@@ -1237,8 +1781,8 @@ struct Engine {
             const float* vb = vbuf[(size_t) L.idx];
             k_conv<<<grid1(g.conv_ch, 128), 128, 0, st>>>(conv[(size_t) L.idx], vb, vcols, L.conv_w, L.conv_b, xc, g.conv_ch,
                                                           n_keep, true);
-            k_ssm<<<g.ssm_H, 256, 0, st>>>(S[(size_t) L.idx], xc, g.conv_ch, vb + g.conv_ch, vcols, L.dt_b, L.A, L.D,
-                                           nullptr, g.ssm_H, g.ssm_G, n_keep, true);
+            k_ssm_fast<<<dim3(8, g.ssm_H), 256, 0, st>>>(S[(size_t) L.idx], xc, g.conv_ch, vb + g.conv_ch, vcols, L.dt_b,
+                                                        L.A, L.D, nullptr, g.ssm_H, g.ssm_G, n_keep, true);
         }
     }
 
@@ -1248,13 +1792,12 @@ struct Engine {
     void rebalance(int max_swaps) {
         static const bool off = std::getenv("STRATA_NH_FIXED_SLOTS") != nullptr;
         if (off || warming) return;
-        const int ne = m->g.E;
         int left = max_swaps;
         CK(cudaStreamSynchronize(st));
         for (size_t mi = 0; mi < hy.size() && left > 0; ++mi) {
             Hy& Hh = hy[mi];
             const Moe& M = moe_layer((int) mi).moe;
-            const int S_ = M.n_slots;
+            const int ne = M.E, S_ = M.n_slots;
             if (S_ <= 0 || S_ >= ne) continue;
             std::vector<int> order((size_t) ne);
             for (int x_ = 0; x_ < ne; ++x_) order[(size_t) x_] = x_;
@@ -1301,6 +1844,10 @@ struct Engine {
             CK(cudaMemcpyAsync(tok, toks + i, (size_t) T * 4, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
             forward(T, pos, i + T == n ? 1 : 0, false);
+            if (df) {
+                const int R = std::min(T, kFeatRows);
+                df->encode_and_inject_f16(feat16, R, (int) (pos + T - R), st);
+            }
             if (m->has_mtp && mtp_d > 0 && prompt_mtp) {
                 CK(cudaMemcpyAsync(seeds, hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
                 if (T > 1) CK(cudaMemcpyAsync(seeds + N, hmain, (size_t) (T - 1) * N * 4, cudaMemcpyDeviceToDevice, st));
@@ -1322,7 +1869,25 @@ struct Engine {
     /// One speculative step with D MTP drafts (greedy), src/qwen35's spec_step: `x_tok` is the next token (decided,
     /// not processed), `fix` the drafts the last window accepted (the MTP block redoes their rows first).  Returns
     /// the accepted count a; picks[0 .. a] are the window's picks.
-    int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks) {
+    /// Sampled verification: given the D drafts (the window's D + 1 logits rows are in `logits`), returns the
+    /// accepted count a and sets picks[0 .. a].  Null: greedy (the window's argmax picks).
+    using Judge = std::function<int(int D, const int32_t* drafts, int32_t* picks)>;
+    int judged(int D, const std::vector<int32_t>& drafts, int32_t* picks, const Judge* judge) {
+        if (judge) return (*judge)(D, drafts.data(), picks);
+        int a = 0;
+        while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+        for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        return a;
+    }
+    /// The first `rows` rows of `logits` (a verify window's) on the host, row-major.
+    void host_logits_rows(int rows, std::vector<float>& out) {
+        out.resize((size_t) rows * m->g.V);
+        CK(cudaMemcpyAsync(out.data(), logits, out.size() * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+    }
+
+    int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
+                  const Judge* judge = nullptr) {
         const int N = m->g.N;
         const int T0 = (int) fix.size() + 1;
         CK(cudaStreamSynchronize(st));
@@ -1362,15 +1927,75 @@ struct Engine {
         forward(T, pos, T, true);
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
-        int a = 0;
-        while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
-        for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        const int a = judged(D, drafts, picks, judge);
         commit(a + 1);
         CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         const int64_t before = pos;
         pos += a + 1;
         if (before / adapt_every != pos / adapt_every) rebalance(adapt_swaps);
         return a;
+    }
+
+    /// One DFlash step: the drafter's block from `x_tok` (decided, not processed) at pos, D of its drafts verified
+    /// in one window of D + 1 rows; the kept rows' features go into the drafter.  Returns the accepted count a;
+    /// picks[0 .. a] are the window's picks.
+    int dflash_step(int x_tok, int D, std::vector<int32_t>& drafts, int32_t* picks, const Judge* judge = nullptr) {
+        const int N = m->g.N;
+        CK(cudaStreamSynchronize(st));
+        const std::vector<int32_t> blk = df->draft(x_tok, (int32_t) pos, nullptr, st);
+        df_ms += df->last_draft_ms();
+        ++df_steps;
+        drafts.assign(blk.begin(), blk.begin() + D);
+        const int T = D + 1;
+        hpin[16] = x_tok;
+        for (int d = 0; d < D; ++d) hpin[17 + d] = drafts[(size_t) d];
+        hpin[1] = (int32_t) pos;
+        CK(cudaMemcpyAsync(tok, hpin + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
+        forward(T, pos, T, true);
+        CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+        const int a = judged(D, drafts, picks, judge);
+        commit(a + 1);
+        df->encode_and_inject_f16(feat16, a + 1, (int) pos, st);
+        CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
+        const int64_t before = pos;
+        pos += a + 1;
+        if (before / adapt_every != pos / adapt_every) rebalance(adapt_swaps);
+        return a;
+    }
+    /// The drafts a speculative step offers (DFlash's, else the MTP block's; 0: no speculation)
+    int spec_d() const { return df ? df_d : mtp_d; }
+    int spec_any(int x_tok, std::vector<int32_t>& fix, std::vector<int32_t>& drafts, int32_t* picks,
+                 const Judge* judge = nullptr) {
+        if (df) return dflash_step(x_tok, df_d, drafts, picks, judge);
+        return spec_step(x_tok, fix, mtp_d, drafts, picks, judge);
+    }
+    /// The drafter on the GPU before the expert slots are sized: its weights (FP16), the shared embedding and head
+    /// (the engine's own Q8_0 copies), the feature buffer, and one inject + draft so its lazy buffers exist too.
+    bool load_dflash(const std::string& path, int d, std::string& err) {
+        const Geo& g = m->g;
+        if (m->embd_type != 8 || m->head.type != 8) { err = "DFlash needs the target's token_embd and output in Q8_0"; return false; }
+        df = std::make_unique<strata::nemotron_h::DFlashDrafter>();
+        if (!df->load(path, "", err)) return false;
+        df->set_target_weights(m->embd, m->head.d, g.V);
+        const auto& cfg = df->config();
+        if (cfg.n_embd != g.N) { err = "the DFlash GGUF's width is not the model's"; return false; }
+        df_ntgt = (int) cfg.target_layers.size();
+        df_col.assign(m->layers.size(), -1);
+        for (int k = 0; k < df_ntgt; ++k) {
+            const int l = cfg.target_layers[(size_t) k];
+            if (l < 0 || l >= (int) m->layers.size()) { err = "a DFlash target layer past the model's"; return false; }
+            df_col[(size_t) l] = k;
+        }
+        df_d = std::max(1, std::min(d, cfg.n_draft));
+        feat16 = dalloc_t<__half>((size_t) kFeatRows * df_ntgt * g.N);
+        CK(cudaMemsetAsync(feat16, 0, (size_t) kFeatRows * df_ntgt * g.N * 2, st));
+        df->encode_and_inject_f16(feat16, std::min(tmax, kFeatRows), 0, st);
+        (void) df->draft(0, std::min(tmax, kFeatRows), nullptr, st);
+        df->reset();
+        CK(cudaStreamSynchronize(st));
+        return true;
     }
 
     void warmup() {
@@ -1381,10 +2006,10 @@ struct Engine {
         std::vector<int32_t> toks((size_t) std::min(hybrid_t, kVerify), filler);
         process(toks.data(), (int64_t) toks.size(), [](int64_t) {});
         process(&filler, 1, [](int64_t) {});
-        if (mtp_d > 0) {
+        if (spec_d() > 0) {
             std::vector<int32_t> fix, drafts;
             int32_t picks[16];
-            spec_step(filler, fix, mtp_d, drafts, picks);
+            spec_any(filler, fix, drafts, picks);
         }
         CK(cudaStreamSynchronize(st));
         warming = false;
@@ -1409,8 +2034,24 @@ struct Engine {
 };
 
 // ------------------------------------------------------------------------------------------------ expert placement
+/// Bytes cudaMalloc takes for `s` slots on every MoE layer (one buffer per layer, 2 MiB rounding, the tail included).
+size_t slots_bytes(const std::vector<Moe*>& all, int s) {
+    size_t b = 0;
+    for (Moe* M : all) {
+        const size_t nb = (size_t) std::max(std::min(M->E, s), 1) * M->stride + kTail;
+        b += (nb + kAllocGran - 1) & ~(kAllocGran - 1);
+    }
+    return b;
+}
+
 /// MemAvailable from /proc/meminfo in bytes (0 when unknown).
 size_t mem_available() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) return (size_t) ms.ullAvailPhys;
+    return 0;
+#else
     std::ifstream f("/proc/meminfo");
     std::string k;
     size_t v = 0;
@@ -1418,6 +2059,7 @@ size_t mem_available() {
     while (f >> k >> v >> unit)
         if (k == "MemAvailable:") return v * 1024;
     return 0;
+#endif
 }
 
 /// The expert profile (Flash-Next's expert-profile.bin idea for this family): per MoE slot index (the main layers,
@@ -1447,7 +2089,8 @@ bool save_profile(const std::string& path, const std::vector<Engine::Hy>& hy, in
         f.write((const char*) hd, sizeof hd);
         std::vector<float> row((size_t) E);
         for (const Engine::Hy& H : hy) {
-            for (int x = 0; x < E; ++x) row[(size_t) x] = (float) H.total[(size_t) x];
+            std::fill(row.begin(), row.end(), 0.f);
+            for (size_t x = 0; x < H.total.size() && x < (size_t) E; ++x) row[x] = (float) H.total[x];
             f.write((const char*) row.data(), (std::streamsize) (E * 4));
         }
         if (!f) return false;
@@ -1469,10 +2112,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int slots,
         if (L.kind == Kind::Moe) all.push_back(&L.moe);
     if (m.has_mtp) all.push_back(&m.mtp_moe.moe);
     size_t per_slot = 0, max_stride = 0, total = 0;
+    int min_e = g.E;
     for (Moe* M : all) {
         per_slot += M->stride;
         max_stride = std::max(max_stride, M->stride);
-        total += (size_t) g.E * M->stride;
+        total += (size_t) M->E * M->stride;
+        min_e = std::min(min_e, M->E);
     }
     // ---- the pinned arena
     bool have_arena = false;
@@ -1508,19 +2153,21 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int slots,
             }
             if (base != nullptr) {
                 size_t off = 0;
+                std::vector<std::pair<Moe*, int>> items;
                 for (Moe* M : all) {
                     M->host = base + off;
-                    off += (size_t) g.E * M->stride;
+                    off += (size_t) M->E * M->stride;
+                    for (int e = 0; e < M->E; ++e) items.push_back({M, e});
                 }
                 // filled by 6 threads (from the page cache, or the disk on a cold start)
                 std::atomic<int> next{0};
-                const int n_items = (int) all.size() * g.E;
+                const int n_items = (int) items.size();
                 std::vector<std::thread> ts;
                 for (int k = 0; k < 6; ++k)
                     ts.emplace_back([&] {
                         for (int i; (i = next.fetch_add(1)) < n_items;) {
-                            Moe& M = *all[(size_t) (i / g.E)];
-                            const int e = i % g.E;
+                            Moe& M = *items[(size_t) i].first;
+                            const int e = items[(size_t) i].second;
                             uint8_t* dst = M.host + (size_t) e * M.stride;
                             std::memcpy(dst, M.src_up + (size_t) e * M.up_bytes, M.up_bytes);
                             std::memcpy(dst + M.L.down_off, M.src_down + (size_t) e * M.d_bytes, M.d_bytes);
@@ -1537,40 +2184,68 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int slots,
                          "is read\n", (double) avail / (1 << 30), (double) (total + keep) / (1 << 30));
         }
     }
-    E.xs.dev = 0;
-    CK(cudaGetDevice(&E.xs.dev));
-    E.xs.init(std::max(4, ring), max_stride, have_arena);
-    // ---- the transient buffers: the PCIe share's experts and two prefetch sets
-    E.tr_stride = max_stride;
-    if (E.pcie_frac <= 0.f) E.pcie_cap = 0;   // the share off: no buffer (its VRAM goes to the slots)
-    if (E.pcie_cap > 0) E.pcbuf = dalloc_t<uint8_t>((size_t) E.pcie_cap * max_stride + kTail);
-    if (E.pf_cap > 0)
-        for (int b = 0; b < 2; ++b) E.pfbuf[b] = dalloc_t<uint8_t>((size_t) E.pf_cap * max_stride + kTail);
-    size_t fr = 0, tot = 0;
-    CK(cudaMemGetInfo(&fr, &tot));
-    const size_t reserve = (size_t) std::max(256, reserve_mib) << 20;   // --vram-reserve-mib (the server's: 700)
-    const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30)) : (fr > reserve ? fr - reserve : 0);
-    int S_ = slots > 0 ? std::min(g.E, slots) : (int) std::min<size_t>((size_t) g.E, budget / std::max<size_t>(per_slot, 1));
-    if (S_ < 0) S_ = 0;
+    if (!have_arena) E.xs.init_bounce();
     std::vector<std::vector<double>> prof;
     const bool have_prof = !profile.empty() && load_profile(profile, (int) all.size(), g.E, prof);
     if (!profile.empty())
         std::fprintf(stderr, "strata-nh: expert profile %s: %s\n", profile.c_str(), have_prof ? "loaded" : "not usable, slots start at 0 .. S-1");
     E.hy.resize(all.size());
+    for (size_t mi = 0; mi < all.size(); ++mi) CK(cudaMalloc(&E.hy[mi].slot_of_d, (size_t) all[mi]->E * 4));
+    E.pool = std::make_unique<strata::nemotron_h::CpuExperts>(threads);
+    CK(cudaDeviceSynchronize());
+    size_t fr = 0, tot = 0;
+    vram_info(fr, tot);
+    const size_t reserve = (size_t) std::max(256, reserve_mib) << 20;   // --vram-reserve-mib (the server's: 700)
+    const size_t target_free = reserve + ((size_t) 32 << 20);           // headroom for runtime/desktop jitter
+    const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30)) : (fr > target_free ? fr - target_free : 0);
+    auto vram_for = [&](int s) { return slots_bytes(all, s); };
+    int S_ = 0;
+    if (slots > 0) {
+        S_ = std::min(g.E, slots);
+    } else {
+        while (S_ < g.E && vram_for(S_ + 1) <= budget) ++S_;
+    }
+    size_t vram_slots = 0;
+    auto alloc_slots = [&]() {
+        vram_slots = 0;
+        for (Moe* M : all) {
+            const int ns = std::min(M->E, S_);
+            M->n_slots = ns;
+            vram_slots += (size_t) ns * M->stride;
+            const size_t nb = M->stride * (size_t) std::max(ns, 1) + kTail;
+            CK(cudaMalloc(&M->slots, nb));
+            CK(cudaMemset(M->slots, 0, nb));
+        }
+        CK(cudaDeviceSynchronize());
+        vram_info(fr, tot);
+    };
+    alloc_slots();
+    while (slots <= 0 && vram_gib < 0 && fr < target_free && S_ > 1) {
+        const size_t deficit = target_free - fr;
+        size_t step = 0;
+        for (Moe* M : all)
+            if (M->E >= S_) step += M->stride;
+        if (step == 0) step = per_slot;
+        const int drop = std::max(1, (int) ((deficit + step - 1) / step));
+        S_ = std::max(1, S_ - drop);
+        for (Moe* M : all) {
+            CK(cudaFree(M->slots));
+            M->slots = nullptr;
+        }
+        alloc_slots();
+    }
     for (size_t mi = 0; mi < all.size(); ++mi) {
         Moe& M = *all[mi];
-        M.n_slots = S_;
-        CK(cudaMalloc(&M.slots, M.stride * (size_t) std::max(S_, 1) + kTail));
-        CK(cudaMemset(M.slots, 0, M.stride * (size_t) std::max(S_, 1) + kTail));
-        std::vector<int> order((size_t) g.E);
-        for (int x = 0; x < g.E; ++x) order[(size_t) x] = x;
+        const int ne = M.E, ns = M.n_slots;
+        std::vector<int> order((size_t) ne);
+        for (int x = 0; x < ne; ++x) order[(size_t) x] = x;
         if (have_prof)
             std::stable_sort(order.begin(), order.end(),
                              [&](int a, int b) { return prof[mi][(size_t) a] > prof[mi][(size_t) b]; });
         Engine::Hy& H = E.hy[mi];
-        H.slot_of.assign((size_t) g.E, -1);
-        H.exp_in_slot.assign((size_t) S_, 0);
-        for (int s = 0; s < S_; ++s) {
+        H.slot_of.assign((size_t) ne, -1);
+        H.exp_in_slot.assign((size_t) ns, 0);
+        for (int s = 0; s < ns; ++s) {
             const int x = order[(size_t) s];
             H.slot_of[(size_t) x] = s;
             H.exp_in_slot[(size_t) s] = x;
@@ -1580,36 +2255,216 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int slots,
         // the profile is also the adaptive tier's prior: its counts scaled to `prior` tokens' worth of routing, so a
         // request's first counts move only the experts it really prefers (they halve with every rebalance as usual).
         // STRATA_NH_PRIOR_TOKENS: that weight (default 1024).
-        H.score.assign((size_t) g.E, 0.0);
+        H.score.assign((size_t) ne, 0.0);
         if (have_prof) {
             static const double prior = std::getenv("STRATA_NH_PRIOR_TOKENS") ? std::atof(std::getenv("STRATA_NH_PRIOR_TOKENS")) : 1024.0;
             double sum = 0;
-            for (double v : prof[mi]) sum += v;
+            for (int x = 0; x < ne; ++x) sum += prof[mi][(size_t) x];
             if (sum > 0)
-                for (int x = 0; x < g.E; ++x) H.score[(size_t) x] = prof[mi][(size_t) x] * prior * g.top_k / sum;
+                for (int x = 0; x < ne; ++x) H.score[(size_t) x] = prof[mi][(size_t) x] * prior * g.top_k / sum;
         }
-        H.total = have_prof ? prof[mi] : std::vector<double>((size_t) g.E, 0.0);
-        CK(cudaMalloc(&H.slot_of_d, (size_t) g.E * 4));
-        CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) g.E * 4, cudaMemcpyHostToDevice));
+        H.total.assign((size_t) ne, 0.0);
+        if (have_prof)
+            for (int x = 0; x < ne; ++x) H.total[(size_t) x] = prof[mi][(size_t) x];
+        CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
     }
-    const size_t T = (size_t) E.tmax, Kp = (size_t) g.top_k;
-    CK(cudaHostAlloc((void**) &E.h_hl, T * g.LAT * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.cpu_out, T * Kp * g.LAT * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.h_ids, T * Kp * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.h_miss, T * Kp * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.h_cnt, (size_t) g.E * 4, cudaHostAllocDefault));
-    E.ecpu = dalloc(T * Kp * g.LAT);
-    E.d_miss = dalloc_t<int32_t>(T * Kp);
-    E.init_transient();
-    CK(cudaEventCreateWithFlags(&E.ev_route, cudaEventDisableTiming | cudaEventBlockingSync));
-    E.pool = std::make_unique<strata::nemotron_h::CpuExperts>(threads);
     CK(cudaDeviceSynchronize());
-    std::fprintf(stderr, "strata-nh: hybrid experts: %d of %d per layer in VRAM (%.2f GiB of %.2f GiB), a batch of <= %d rows "
-                 "on the GPU + %d CPU threads (PCIe share %.2f, up to %d experts; prefetch %d), bigger chunks streamed through "
-                 "%d buffers (%.2f GiB); %.1f s\n", S_, g.E, (double) S_ * per_slot / (1 << 30), (double) total / (1 << 30),
-                 E.hybrid_t, E.pool->threads(), E.pcie_frac, E.pcie_cap, E.pf_cap, E.xs.nr,
-                 (double) E.xs.nr * max_stride / (1 << 30), ms_since(t0) / 1000.0);
+    vram_info(fr, tot);
+    if (min_e == g.E)
+        std::fprintf(stderr, "strata-nh: hybrid experts: %d of %d per layer in VRAM (%.2f GiB of %.2f GiB), a batch of <= %d rows "
+                     "on the GPU + %d CPU threads (PCIe share %.2f, up to %d experts; prefetch %d), bigger chunks streamed through "
+                     "%d buffers (%.2f GiB), %.2f GiB (%zu MiB) of VRAM free; %.1f s\n", S_, g.E, (double) vram_slots / (1 << 30),
+                     (double) total / (1 << 30), E.hybrid_t, E.pool->threads(), E.pcie_frac, E.pcie_cap, E.pf_cap, E.xs.nr,
+                     (double) E.xs.nr * max_stride / (1 << 30), (double) fr / (1 << 30), fr >> 20, ms_since(t0) / 1000.0);
+    else
+        std::fprintf(stderr, "strata-nh: hybrid experts: up to %d of %d..%d per layer in VRAM (%.2f GiB of %.2f GiB), a batch of <= %d rows "
+                     "on the GPU + %d CPU threads (PCIe share %.2f, up to %d experts; prefetch %d), bigger chunks streamed through "
+                     "%d buffers (%.2f GiB), %.2f GiB (%zu MiB) of VRAM free; %.1f s\n", S_, min_e, g.E, (double) vram_slots / (1 << 30),
+                     (double) total / (1 << 30), E.hybrid_t, E.pool->threads(), E.pcie_frac, E.pcie_cap, E.pf_cap, E.xs.nr,
+                     (double) E.xs.nr * max_stride / (1 << 30), (double) fr / (1 << 30), fr >> 20, ms_since(t0) / 1000.0);
+    (void) ring;
     (void) err;
+    E.vram_moe = all;
+    E.slots_cap = std::max(S_, 1);
+    E.slots_now = S_;
+    E.vram_reserve_mib = std::max(256, reserve_mib);
+    std::fprintf(stderr, "strata-nh: elastic VRAM: POST /v1/vram frees or refills expert slots "
+                         "(dense weights, the KV cache and %d MiB stay)\n", E.vram_reserve_mib);
+    return true;
+}
+
+/// Put `S` slots on every layer (capped by that layer's expert count).  The kept experts are the hottest by the
+/// router statistics (the decayed score, then the lifetime count, then whoever is already resident).  The old
+/// buffers are freed before the new ones are allocated: a shrink is asked for when both would not fit.
+bool set_slots_once(Engine& E, int S, std::string& err) {
+    auto fail = [&](cudaError_t e, const char* what) {
+        if (e == cudaSuccess) return false;
+        err = std::string("VRAM: ") + what + ": " + cudaGetErrorString(e);
+        (void) cudaGetLastError();
+        return true;
+    };
+    // A previous failed resize may have left a sticky error.  Drop it: this call rebuilds the slot buffers.
+    (void) cudaDeviceSynchronize();
+    (void) cudaGetLastError();
+    E.xs.finish();
+    for (Moe* M : E.vram_moe) {
+        if (M->slots != nullptr) {
+            cudaFree(M->slots);
+            M->slots = nullptr;
+        }
+        M->n_slots = 0;
+    }
+    (void) cudaGetLastError();
+    std::vector<uint8_t*> fresh(E.vram_moe.size(), nullptr);
+    for (size_t mi = 0; mi < E.vram_moe.size(); ++mi) {
+        Moe* M = E.vram_moe[mi];
+        const int ns = std::min(M->E, S);
+        const size_t nb = (size_t) std::max(ns, 1) * M->stride + kTail;
+        const cudaError_t e = cudaMalloc((void**) &fresh[mi], nb);
+        if (e != cudaSuccess) {
+            err = std::string("VRAM: cudaMalloc: ") + cudaGetErrorString(e);
+            (void) cudaGetLastError();
+            for (uint8_t* p : fresh)
+                if (p) cudaFree(p);
+            return false;
+        }
+        if (fail(cudaMemset(fresh[mi], 0, nb), "cudaMemset")) {
+            for (uint8_t* p : fresh)
+                if (p) cudaFree(p);
+            return false;
+        }
+    }
+    for (size_t mi = 0; mi < E.vram_moe.size(); ++mi) {
+        Moe& M = *E.vram_moe[mi];
+        const int ne = M.E, ns = std::min(ne, S);
+        M.slots = fresh[mi];
+        M.n_slots = ns;
+        Engine::Hy& H = E.hy[mi];
+        if ((int) H.score.size() < ne || (int) H.total.size() < ne || H.slot_of_d == nullptr) {
+            err = "VRAM: the router statistics are missing";
+            return false;
+        }
+        std::vector<char> was((size_t) ne, 0);
+        if ((int) H.slot_of.size() == ne)
+            for (int x = 0; x < ne; ++x) was[(size_t) x] = H.slot_of[(size_t) x] >= 0 ? 1 : 0;
+        std::vector<int> order((size_t) ne);
+        for (int x = 0; x < ne; ++x) order[(size_t) x] = x;
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+            const double sa = H.score[(size_t) a], sb = H.score[(size_t) b];
+            if (sa != sb) return sa > sb;
+            const double ta = H.total[(size_t) a], tb = H.total[(size_t) b];
+            if (ta != tb) return ta > tb;
+            if (was[(size_t) a] != was[(size_t) b]) return was[(size_t) a] > was[(size_t) b];
+            return a < b;
+        });
+        H.slot_of.assign((size_t) ne, -1);
+        H.exp_in_slot.assign((size_t) std::max(ns, 0), 0);
+        for (int s = 0; s < ns; ++s) {
+            const int x = order[(size_t) s];
+            H.slot_of[(size_t) x] = s;
+            H.exp_in_slot[(size_t) s] = x;
+            uint8_t* dst = M.slots + (size_t) s * M.stride;
+            if (fail(cudaMemcpyAsync(dst, M.up_of(x), M.up_bytes, cudaMemcpyHostToDevice, E.st), "expert upload") ||
+                fail(cudaMemcpyAsync(dst + M.L.down_off, M.down_of(x), M.d_bytes, cudaMemcpyHostToDevice, E.st),
+                     "expert upload"))
+                return false;
+        }
+        if (fail(cudaMemcpyAsync(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice, E.st),
+                 "slot table"))
+            return false;
+    }
+    if (fail(cudaStreamSynchronize(E.st), "cudaStreamSynchronize")) return false;
+    E.slots_now = S;
+    return true;
+}
+
+bool set_slots(Engine& E, int S, std::string& err) {
+    S = std::max(1, std::min(S, std::max(E.slots_cap, 1)));
+    if (set_slots_once(E, S, err)) return true;
+    if (S == 1) return false;
+    const std::string why = err;
+    std::string kept;
+    if (!set_slots_once(E, 1, kept)) {
+        if (!kept.empty()) err = why + "; " + kept;
+        return false;
+    }
+    std::fprintf(stderr, "strata-nh: VRAM resize to %d slots a layer failed (%s); kept 1\n", S, why.c_str());
+    err.clear();
+    return true;
+}
+
+/// `VRAM` or `VRAM <reserve_mib>` between requests.  Prints one `VRAM k=v ...` line on success (the server's
+/// POST /v1/vram shape).  A bare command uses the reserve the engine started with.
+bool vram_command(Engine& E, const std::string& cmd, std::string& err) {
+    if (E.vram_moe.empty() || E.slots_cap <= 0) {
+        err = "VRAM: this engine has no expert slots to resize";
+        return false;
+    }
+    const bool bare = cmd.find_first_not_of(' ', 4) == std::string::npos;
+    char* end = nullptr;
+    const long long reserve = bare ? (long long) E.vram_reserve_mib : std::strtoll(cmd.c_str() + 4, &end, 10);
+    if (!bare) {
+        if (end == cmd.c_str() + 4 || reserve < 0) {
+            err = "expected: VRAM [reserve_mib]";
+            return false;
+        }
+        while (*end == ' ') ++end;
+        if (*end != '\0') {
+            err = "expected: VRAM [reserve_mib]";
+            return false;
+        }
+    }
+    const auto t0 = Clock::now();
+    const int before = E.slots_now;
+    // Below the startup margin the cache only refills to the size it was given at start (that size already
+    // leaves the margin).  Above it, slots are dropped until the measured free VRAM covers the request.
+    int S = E.slots_now;
+    if (reserve <= (long long) E.vram_reserve_mib) {
+        S = E.slots_cap;
+    } else {
+        size_t fr = 0, tot = 0;
+        vram_info(fr, tot);
+        const size_t cur = slots_bytes(E.vram_moe, E.slots_now);
+        const size_t want = (size_t) reserve << 20;
+        const size_t guard = (size_t) 256 << 20;
+        const size_t budget = fr + cur > want + guard ? fr + cur - want - guard : 0;
+        int t = 0;
+        while (t < E.slots_cap && slots_bytes(E.vram_moe, t + 1) <= budget) ++t;
+        S = std::max(1, t);
+    }
+    if (S != E.slots_now && !set_slots(E, S, err)) return false;
+    size_t fr = 0, tot = 0;
+    vram_info(fr, tot);
+    const size_t target = (size_t) std::max(reserve, (long long) E.vram_reserve_mib) << 20;
+    std::string note;
+    for (int spins = 0; fr < target && E.slots_now > 1 && spins < 6; ++spins) {
+        size_t step = 0;
+        for (Moe* M : E.vram_moe)
+            if (M->E >= E.slots_now) step += M->stride;
+        if (step == 0) step = 1;
+        const int drop = std::max(1, (int) (((target - fr) + step - 1) / step));
+        const int next = std::max(1, E.slots_now - drop);
+        if (next == E.slots_now) break;
+        if (!set_slots(E, next, err)) return false;
+        vram_info(fr, tot);
+        note = " (trimmed until the reserve held)";
+    }
+    if (fr < ((size_t) reserve << 20)) note = " (the cache keeps its smallest size)";
+    long long slots = 0, full = 0;
+    for (Moe* M : E.vram_moe) {
+        slots += M->n_slots;
+        full += std::min(M->E, E.slots_cap);
+    }
+    const long long cache_mib = (long long) (slots_bytes(E.vram_moe, std::max(E.slots_now, 1)) >> 20);
+    const long long full_mib = (long long) (slots_bytes(E.vram_moe, E.slots_cap) >> 20);
+    std::fprintf(stderr, "strata-nh: VRAM %lld MiB kept free: expert slots %d -> %d of %d per layer "
+                         "(%lld of %lld slots, %lld of %lld MiB), %zu MiB free now, in %.0f ms%s\n",
+                 reserve, before, E.slots_now, E.slots_cap, slots, full, cache_mib, full_mib, fr >> 20,
+                 ms_since(t0), note.c_str());
+    std::printf("VRAM reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld expert_cache_mib=%lld "
+                "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld\n",
+                reserve, slots, full, cache_mib, full_mib, (long long) (fr >> 20), (long long) E.prompt_chunk);
+    std::fflush(stdout);
     return true;
 }
 
@@ -1621,7 +2476,10 @@ struct Sampling {
     bool needs_logits() const { return temperature > 0.f || repeat != 1.f || freq != 0.f || present != 0.f; }
 };
 
-int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
+/// The sampler's candidates and their weights (penalties, temperature, top-k, min-p, top-p applied; not
+/// normalized).  Temperature 0: the argmax alone.
+void candidates(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::vector<int>& idx,
+                std::vector<double>& p) {
     if (s.last_n != 0 && (s.repeat != 1.f || s.freq != 0.f || s.present != 0.f)) {
         std::map<int, int> cnt;
         const size_t from = s.last_n < 0 || (size_t) s.last_n >= hist.size() ? 0 : hist.size() - (size_t) s.last_n;
@@ -1632,13 +2490,17 @@ int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>
             v -= (float) c * s.freq + s.present;
         }
     }
-    if (s.temperature <= 0.f) return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+    if (s.temperature <= 0.f) {
+        idx.assign(1, (int) (std::max_element(lg.begin(), lg.end()) - lg.begin()));
+        p.assign(1, 1.0);
+        return;
+    }
     const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
-    std::vector<int> idx(lg.size());
+    idx.resize(lg.size());
     for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
     std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
     idx.resize((size_t) kk);
-    std::vector<double> p(idx.size());
+    p.assign(idx.size(), 0.0);
     const double mx = lg[(size_t) idx[0]];
     double sum = 0;
     for (size_t i = 0; i < idx.size(); ++i) sum += (p[i] = std::exp((lg[(size_t) idx[i]] - mx) / s.temperature));
@@ -1650,13 +2512,68 @@ int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>
         if (cum >= s.top_p) { keep = i + 1; break; }
     }
     keep = std::max<size_t>(1, keep);
+    idx.resize(keep);
+    p.resize(keep);
+}
+
+/// One draw from the candidates, `skip` (a rejected draft) left out.
+int draw(const std::vector<int>& idx, const std::vector<double>& p, int skip, std::mt19937_64& rng) {
     double tot = 0;
-    for (size_t i = 0; i < keep; ++i) tot += p[i];
+    for (size_t i = 0; i < idx.size(); ++i)
+        if (idx[i] != skip) tot += p[i];
+    if (tot <= 0) return idx[0];
     std::uniform_real_distribution<double> u(0.0, tot);
     double r = u(rng);
-    for (size_t i = 0; i < keep; ++i)
+    int last = idx[0];
+    for (size_t i = 0; i < idx.size(); ++i) {
+        if (idx[i] == skip) continue;
+        last = idx[i];
         if ((r -= p[i]) <= 0) return idx[i];
-    return idx[keep - 1];
+    }
+    return last;
+}
+
+int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
+    std::vector<int> idx;
+    std::vector<double> p;
+    candidates(lg, s, hist, idx, p);
+    return draw(idx, p, -1, rng);
+}
+
+/// Speculative sampling with a deterministic drafter (exact: the tokens come out distributed as plain sampling's):
+/// row i keeps draft i with the probability the sampler gives it there; a rejected draft's row samples again with
+/// that draft left out; when all D are kept, the last row samples the next token.  `hist` (the history so far) gets
+/// the kept drafts for the penalties and is restored.
+int spec_judge(const std::vector<float>& rows, int V, const Sampling& s, std::vector<int32_t>& hist,
+               std::mt19937_64& rng, int D, const int32_t* drafts, int32_t* picks) {
+    std::vector<float> lg;
+    std::vector<int> idx;
+    std::vector<double> p;
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+    const size_t h0 = hist.size();
+    int a = 0;
+    for (;; ++a) {
+        lg.assign(rows.begin() + (size_t) a * V, rows.begin() + (size_t) (a + 1) * V);
+        candidates(lg, s, hist, idx, p);
+        if (a == D) {
+            picks[a] = draw(idx, p, -1, rng);
+            break;
+        }
+        double tot = 0, px = 0;
+        for (size_t i = 0; i < idx.size(); ++i) {
+            tot += p[i];
+            if (idx[i] == drafts[a]) px = p[i];
+        }
+        if (u01(rng) * tot < px) {
+            picks[a] = drafts[a];
+            hist.push_back(drafts[a]);
+            continue;
+        }
+        picks[a] = draw(idx, p, drafts[a], rng);
+        break;
+    }
+    hist.resize(h0);
+    return a;
 }
 
 std::vector<int32_t> parse_ids(const char* s) {
@@ -1735,6 +2652,16 @@ int serve(Engine& E) {
             lines.pop_front();
         }
         if (line.empty()) continue;
+        // Between requests only: a VRAM line that arrives during a GEN sits in this queue until DONE, so a shrink
+        // cannot run against a generation in progress (the server also holds its FIFO until that generation ends).
+        if (line == "VRAM" || line.rfind("VRAM ", 0) == 0) {
+            std::string e;
+            if (!vram_command(E, line, e)) {
+                std::printf("ERR %s\n", e.c_str());
+                std::fflush(stdout);
+            }
+            continue;
+        }
         const bool geni = line.rfind("GENI ", 0) == 0;
         if (!geni && line.rfind("GEN ", 0) != 0) {
             std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...> or GENI <max_new> [key=value ...] <file> "
@@ -1880,13 +2807,20 @@ int serve(Engine& E) {
         const auto d0 = Clock::now();
         long long produced = 0, offered = 0, accepted = 0;
         const char* finish = "length";
-        const bool spec = E.mtp_d > 0 && !smp.needs_logits();
+        const bool spec = E.spec_d() > 0;
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
+        std::vector<float> rows;
+        Engine::Judge judge = [&](int D, const int32_t* dr, int32_t* pk) {
+            E.host_logits_rows(D + 1, rows);
+            return spec_judge(rows, E.m->g.V, smp, hist, rng, D, dr, pk);
+        };
+        const Engine::Judge* jp = smp.needs_logits() ? &judge : nullptr;
         int nx = smp.needs_logits() ? -1 : E.greedy();
+        bool have_nx = !smp.needs_logits();
         bool done = false;
         while (!done) {
-            if (smp.needs_logits()) {
+            if (!have_nx) {
                 E.host_logits(lg);
                 nx = sample(lg, smp, hist, rng);
             }
@@ -1901,9 +2835,9 @@ int serve(Engine& E) {
                 return true;
             };
             if (!emit(nx)) break;
-            if (spec && E.pos + E.mtp_d + 1 <= E.ctx) {
-                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks);
-                offered += E.mtp_d;
+            if (spec && E.pos + E.spec_d() + 1 <= E.ctx) {
+                const int a = E.spec_any(nx, fix, drafts, picks, jp);
+                offered += E.spec_d();
                 accepted += a;
                 live.push_back(nx);
                 fix.assign(drafts.begin(), drafts.begin() + a);
@@ -1912,6 +2846,7 @@ int serve(Engine& E) {
                     if (!emit(drafts[(size_t) i])) { done = true; break; }
                 }
                 nx = picks[a];
+                have_nx = true;
                 continue;
             }
             if (E.pos + 1 > E.ctx) break;
@@ -1919,7 +2854,8 @@ int serve(Engine& E) {
             E.process(&one, 1, [](int64_t) {});
             live.push_back(nx);
             fix.clear();
-            if (!smp.needs_logits()) nx = E.greedy();
+            have_nx = !smp.needs_logits();
+            if (have_nx) nx = E.greedy();
         }
         const double decode_ms = ms_since(d0);
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
@@ -1936,11 +2872,13 @@ int serve(Engine& E) {
 int strata::nemotron_h::run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, dump_layers;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 64;
+    std::string dflash;
+    int dflash_d = 4;   // docs/NEMOTRON_H.md (Bolt): D = 4 best on chat, within 5% of D = 5 on code
     // the PCIe share and the prefetch are off by default: measured on the RTX 3090 + i7-7800X (DDR4-2133, quad
     // channel) the CPU experts already read RAM at its ceiling (~40 GB/s), and the uploads read the same RAM
     // (docs/NEMOTRON_H.md); a faster PCIe link or a slower CPU is where they pay
     int expert_slots = 0, ring = 64, reserve_mib = 1024, pcie_max = 48, prefetch = 0;
-    float pcie_frac = 0.f;
+    float pcie_frac = -1.f;   // unset: 0.5 with DFlash (its 5-row verify shares many experts: 61 -> 72 tok/s), else 0
     bool arena = true;
     std::string profile, profile_save;
     int adapt_every = 32, adapt_swaps = 8;
@@ -1974,6 +2912,8 @@ int strata::nemotron_h::run(int argc, char** argv) {
             else std::fprintf(stderr, "strata-nh: ignoring --mtp %s (this family's MTP is the GGUF's own block: --mtp N drafts)\n",
                               v.c_str());
         }
+        else if (a == "--dflash") dflash = next();
+        else if (a == "--dflash-d") dflash_d = std::atoi(next().c_str());
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
@@ -1988,6 +2928,8 @@ int strata::nemotron_h::run(int argc, char** argv) {
         else if (a == "--adapt-swaps") adapt_swaps = std::max(0, std::atoi(next().c_str()));
         else if (a == "--expert-profile-save") profile_save = next();
         else if (a == "--vram-reserve-mib") reserve_mib = std::atoi(next().c_str());
+        else if (a == "--vram-elastic") {}   // the server's flag: slots resize on VRAM, there is no segment map
+        else if (a == "--vram-segment-mib") (void) next();
         else if (a == "--vision") {}   // the server's: images come as GENI requests, which this engine always takes
         else if (serve_mode && a.rfind("--", 0) == 0) {
             const bool val = i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0;
@@ -1997,8 +2939,9 @@ int strata::nemotron_h::run(int argc, char** argv) {
         } else {
             std::fprintf(stderr,
                          "usage: strata-nh --model GGUF [--max-context 32768] [--chunk 1024] [--mtp N] [--expert-vram GiB]\n"
+                         "       [--dflash GGUF] [--dflash-d 4]\n"
                          "       [--expert-slots N] [--hybrid-rows 64] [--cpu-threads N] [--stream-ring 64] [--pin-experts]\n"
-                         "       [--vram-reserve-mib 1024] [--pcie-frac 0] [--pcie-max 48] [--prefetch 0] [--no-arena]\n"
+                         "       [--vram-reserve-mib 1024] [--pcie-frac 0, 0.5 with --dflash] [--pcie-max 48] [--prefetch 0] [--no-arena]\n"
                          "       [--expert-profile F] [--expert-profile-save F] [--adapt-every 32] [--adapt-swaps 8]\n"
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] [--dump-layers F] |\n"
                          "        --bench-pp N --bench-tg N)\n");
@@ -2006,7 +2949,12 @@ int strata::nemotron_h::run(int argc, char** argv) {
         }
     }
     if (model.empty()) { std::fprintf(stderr, "strata-nh: --model is required\n"); return 2; }
-#if !defined(_WIN32)
+#if defined(_WIN32)
+    if (!std::getenv("CUDA_MODULE_LOADING")) {
+        _putenv("CUDA_MODULE_LOADING=EAGER");
+        SetEnvironmentVariableA("CUDA_MODULE_LOADING", "EAGER");
+    }
+#else
     setenv("CUDA_MODULE_LOADING", "EAGER", 0);
 #endif
     if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "strata-nh: --mtp takes 0 .. 7 drafts\n"); return 2; }
@@ -2022,6 +2970,7 @@ int strata::nemotron_h::run(int argc, char** argv) {
     }
     Engine E;
     E.hybrid_t = std::max(1, std::min(hybrid_rows, chunk));
+    if (pcie_frac < 0.f) pcie_frac = dflash.empty() ? 0.f : 0.5f;
     E.pcie_frac = std::max(0.f, std::min(1.f, pcie_frac));
     E.pcie_cap = std::max(0, pcie_max);
     E.pf_cap = std::max(0, prefetch);
@@ -2029,7 +2978,17 @@ int strata::nemotron_h::run(int argc, char** argv) {
     E.adapt_every = adapt_every;
     E.adapt_swaps = adapt_swaps;
     (void) pin;
-    E.init(m, ctx, chunk);
+    E.init(m, ctx, chunk, ring);
+    E.prompt_chunk = chunk;
+    if (!dflash.empty()) {
+        try {
+            if (!E.load_dflash(dflash, dflash_d, err)) { std::fprintf(stderr, "strata-nh: --dflash: %s\n", err.c_str()); return 1; }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata-nh: --dflash: %s\n", e.what());
+            return 1;
+        }
+        std::fprintf(stderr, "strata-nh: DFlash drafter %s, %d drafts a step\n", dflash.c_str(), E.df_d);
+    }
     if (!place_experts(m, E, expert_vram, cpu_threads, expert_slots, ring, arena, reserve_mib, profile, err)) {
         std::fprintf(stderr, "strata-nh: %s\n", err.c_str());
         return 1;
@@ -2087,7 +3046,7 @@ int strata::nemotron_h::run(int argc, char** argv) {
     E.process(prompt.data(), (int64_t) prompt.size(), [](int64_t) {});
     const double pp_ms = ms_since(t0);
     const auto t1 = Clock::now();
-    if (E.mtp_d > 0 && forced.empty() && !ff) {
+    if (E.spec_d() > 0 && forced.empty() && !ff) {
         long long offered = 0, accepted = 0;
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
@@ -2095,8 +3054,8 @@ int strata::nemotron_h::run(int argc, char** argv) {
         while ((int) gen.size() < n_gen) {
             gen.push_back(nx);
             if ((int) gen.size() >= n_gen) break;
-            const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks);
-            offered += E.mtp_d;
+            const int a = E.spec_any(nx, fix, drafts, picks);
+            offered += E.spec_d();
             accepted += a;
             fix.assign(drafts.begin(), drafts.begin() + a);
             for (int i = 0; i < a && (int) gen.size() < n_gen; ++i) gen.push_back(drafts[(size_t) i]);
@@ -2106,9 +3065,13 @@ int strata::nemotron_h::run(int argc, char** argv) {
         std::printf("gen:");
         for (int t : gen) std::printf(" %d", t);
         std::printf("\n");
-        std::fprintf(stderr, "strata-nh: prompt %zu tokens in %.1f ms, %zu generated in %.1f ms (%.2f tok/s), MTP %d drafts: "
-                     "%lld of %lld accepted (%.0f%%)\n", prompt.size(), pp_ms, gen.size(), ms_since(t1),
-                     gen.size() / (ms_since(t1) / 1000.0), E.mtp_d, accepted, offered, offered ? 100.0 * accepted / offered : 0.0);
+        std::fprintf(stderr, "strata-nh: prompt %zu tokens in %.1f ms, %zu generated in %.1f ms (%.2f tok/s), %s %d drafts: "
+                     "%lld of %lld accepted (%.0f%%, %.2f tokens a step)\n", prompt.size(), pp_ms, gen.size(), ms_since(t1),
+                     gen.size() / (ms_since(t1) / 1000.0), E.df ? "DFlash" : "MTP", E.spec_d(), accepted, offered,
+                     offered ? 100.0 * accepted / offered : 0.0, offered ? 1.0 + (double) accepted * E.spec_d() / offered : 0.0);
+        if (E.df)
+            std::fprintf(stderr, "strata-nh: DFlash drafting %.2f ms a step (%lld steps)\n", E.df_steps ? E.df_ms / E.df_steps : 0.0,
+                         E.df_steps);
         return 0;
     }
     for (int i = 0; i < n_gen; ++i) {
