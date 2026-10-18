@@ -1781,8 +1781,8 @@ struct Engine {
             const float* vb = vbuf[(size_t) L.idx];
             k_conv<<<grid1(g.conv_ch, 128), 128, 0, st>>>(conv[(size_t) L.idx], vb, vcols, L.conv_w, L.conv_b, xc, g.conv_ch,
                                                           n_keep, true);
-            k_ssm<<<g.ssm_H, 256, 0, st>>>(S[(size_t) L.idx], xc, g.conv_ch, vb + g.conv_ch, vcols, L.dt_b, L.A, L.D,
-                                           nullptr, g.ssm_H, g.ssm_G, n_keep, true);
+            k_ssm_fast<<<dim3(8, g.ssm_H), 256, 0, st>>>(S[(size_t) L.idx], xc, g.conv_ch, vb + g.conv_ch, vcols, L.dt_b,
+                                                        L.A, L.D, nullptr, g.ssm_H, g.ssm_G, n_keep, true);
         }
     }
 

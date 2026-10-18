@@ -29,7 +29,7 @@ struct SsmWs {
 void ssm_ws_reserve(SsmWs& ws, int H, int P, int N, int G, int T);
 void ssm_ws_free(SsmWs& ws);
 
-/// The current path: k_ssm, one block per head, sequential over T (32 state values per thread).  P=64, N=128.
+/// Decode / short chunks: k_ssm_fast (coalesced state, 8 warps per head-group of p).  P=64, N=128.
 void ssm_scan_seq(float* state, const float* xc, int C_, const float* dt, int ld_dt, const float* dt_bias,
                   const float* A, const float* D, float* y, int H, int G, int T, bool write, cudaStream_t st);
 

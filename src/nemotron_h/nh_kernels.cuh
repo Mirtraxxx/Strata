@@ -466,6 +466,48 @@ __global__ void __launch_bounds__(256) k_ssm(float* state, const float* xc, int 
     for (int i = 0; i < 32; ++i) base[i] = s[i];
 }
 
+/// Same recurrence as k_ssm, coalesced.  One warp owns one (head, p) and 128 state lanes as float4 at n = 4 * lane,
+/// so the [H][P][N] load and store is a single 512-byte warp transaction instead of a 128-byte stride.  A block is
+/// 8 warps (8 values of p of one head); grid (P/8, H) = (8, H).  B and C (128 floats, shared by every p of the head)
+/// are staged once per token.  P = 64 and N = 128, the geometry the engine accepts.  y's 128-term dot is a warp sum,
+/// so its rounding can differ from k_ssm; each state element is still `s * dA + B * (x * dt)`.
+__global__ void __launch_bounds__(256, 4) k_ssm_fast(float* state, const float* xc, int C_, const float* dt, int ld_dt,
+                                                    const float* dt_bias, const float* A, const float* D, float* y,
+                                                    int H, int G, int T, bool write) {
+    __shared__ float4 sB[32], sC[32];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int head = (int) blockIdx.y;
+    const int p = (int) blockIdx.x * 8 + warp;
+    const int g = head / (H / G);
+    const int HP = H * kSsmP;
+    float4 st = *reinterpret_cast<float4*>(state + ((size_t) head * kSsmP + p) * kSsmN + lane * 4);
+    const float a = A[head], dd = D[head], db = dt_bias[head];
+    for (int t = 0; t < T; ++t) {
+        const float* row = xc + (size_t) t * C_;
+        if (warp == 0) {
+            sB[lane] = *reinterpret_cast<const float4*>(row + HP + g * kSsmN + lane * 4);
+            sC[lane] = *reinterpret_cast<const float4*>(row + HP + G * kSsmN + g * kSsmN + lane * 4);
+        }
+        __syncthreads();
+        const float dts = softplus(dt[(size_t) t * ld_dt + head] + db);
+        const float dA = expf(dts * a);
+        const float x = row[head * kSsmP + p];
+        const float xdt = x * dts;
+        const float4 b = sB[lane], c = sC[lane];
+        st.x = st.x * dA + b.x * xdt;
+        st.y = st.y * dA + b.y * xdt;
+        st.z = st.z * dA + b.z * xdt;
+        st.w = st.w * dA + b.w * xdt;
+        float acc = st.x * c.x + st.y * c.y + st.z * c.z + st.w * c.w;
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+        if (y != nullptr && lane == 0) y[(size_t) t * HP + head * kSsmP + p] = acc + x * dd;
+        __syncthreads();
+    }
+    if (!write) return;
+    *reinterpret_cast<float4*>(state + ((size_t) head * kSsmP + p) * kSsmN + lane * 4) = st;
+}
+
 /// y = rms_group(y_ssm * SiLU(z)) * w: the gate (ggml_swiglu_split(z, y)) then the grouped RMS norm over
 /// group_size channels (Zamba2RMSNormGated).  z rows `ld_z` floats apart.  grid (n_group, T), block 256.
 __global__ void k_gate_norm(const float* yin, const float* z, int ld_z, const float* w, float* out, int d_inner,

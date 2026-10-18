@@ -2,7 +2,7 @@
 // Synthetic inputs of Bolt's shape (128 heads x 64, state 128, 8 groups), a non-zero initial state, no model.
 //
 //   nh_ssm_scan_test            seq vs SSD at T = 1, 7, 64, 1000, 8192 (max |d|/max |v| < 1e-3 on y and state)
-//                               then times both paths at T = 2048 and 8192 (ms / layer)
+//                               then times both paths at T = 1, 2048 and 8192 (ms / layer)
 #include "nh_kernels.cuh"
 #include "nh_ssm_scan.cuh"
 
@@ -218,8 +218,7 @@ int main(int, char**) {
     ck(cudaGetDevice(&dev), "dev");
     cudaDeviceProp p{};
     ck(cudaGetDeviceProperties(&p, dev), "prop");
-    std::printf("nh_ssm_scan_test: %s  current path k_ssm (1 block/head, sequential over T, 32 state regs/thread)\n",
-                p.name);
+    std::printf("nh_ssm_scan_test: %s  sequential path k_ssm_fast (coalesced state, 8 warps per head)\n", p.name);
     std::printf("Bolt shape: H=%d P=%d N=%d G=%d conv_ch=%d  SSD chunk=%d  min tok for dispatch=%d\n", H, P, N, G, C_,
                 nh::kSsmSsdChunk, nh::kSsmSsdMinTok);
     cublasHandle_t blas = nullptr;
@@ -234,6 +233,8 @@ int main(int, char**) {
     std::printf("max relative error  y=%.3e  state=%.3e  tol=%.0e  %s\n", yworst, sworst, kTol,
                 fail ? "FAIL" : "PASS");
     std::printf("microbench (median of 20 after 5 warmup, one scan = one layer):\n");
+    std::printf("T=1 decode (median of 50 after 10 warmup):\n");
+    bench_t(1, blas, 10, 50);
     bench_t(2048, blas, 5, 20);
     bench_t(8192, blas, 5, 20);
     cublasDestroy(blas);
