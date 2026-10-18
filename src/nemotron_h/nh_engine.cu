@@ -2175,6 +2175,30 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int slots,
                     });
                 for (auto& t : ts) t.join();
                 have_arena = true;
+                // the copy touched every expert through the mapping, and nothing reads the file's expert tensors
+                // again (up_of / down_of take the arena): give those pages back, or the OS counts the 16 GB of
+                // experts twice in this process (the arena + the mapped file).  The pages stay file-backed, so a
+                // stray read just faults them in again.
+                auto trim = [](const uint8_t* p, size_t bytes) {
+#if defined(_WIN32)
+                    SYSTEM_INFO si{};
+                    GetSystemInfo(&si);
+                    const size_t pg = si.dwPageSize;
+#else
+                    const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
+#endif
+                    const uintptr_t a = ((uintptr_t) p + pg - 1) / pg * pg, b = ((uintptr_t) p + bytes) / pg * pg;
+                    if (b <= a) return;
+#if defined(_WIN32)
+                    (void) VirtualUnlock((LPVOID) a, (SIZE_T) (b - a));   // unlocked range: trims it (ERROR_NOT_LOCKED)
+#else
+                    (void) madvise((void*) a, (size_t) (b - a), MADV_DONTNEED);
+#endif
+                };
+                for (Moe* M : all) {
+                    trim(M->src_up, (size_t) M->E * M->up_bytes);
+                    trim(M->src_down, (size_t) M->E * M->d_bytes);
+                }
             }
             std::fprintf(stderr, "strata-nh: expert arena: %s (%s, %.2f GiB pinned, %.1f s)\n",
                          have_arena ? "every routed expert in pinned RAM" : "pinning failed, the mapped file is read", how,
